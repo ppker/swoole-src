@@ -10,12 +10,16 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
 #ifndef PHP_SWOOLE_H
 #define PHP_SWOOLE_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include "php.h"
 #include "php_ini.h"
@@ -29,9 +33,16 @@
 #include "zend_interfaces.h"
 #include "zend_closures.h"
 #include "zend_exceptions.h"
+#if PHP_VERSION_ID >= 80200
+#include "zend_attributes.h"
+#endif
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 extern zend_module_entry swoole_module_entry;
@@ -48,11 +59,12 @@ ZEND_BEGIN_MODULE_GLOBALS(swoole)
     zend_bool display_errors;
     zend_bool cli;
     zend_bool use_shortname;
-    zend_bool enable_coroutine;
     zend_bool enable_preemptive_scheduler;
     zend_bool enable_library;
+    zend_bool enable_fiber_mock;
     long socket_buffer_size;
     int req_status;
+    HashTable *in_autoload;
 ZEND_END_MODULE_GLOBALS(swoole)
 // clang-format on
 

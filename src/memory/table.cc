@@ -35,7 +35,7 @@ Table *Table::make(uint32_t rows_size, float conflict_proportion) {
         conflict_proportion = SW_TABLE_CONFLICT_PROPORTION;
     }
 
-    Table *table = (Table *) sw_mem_pool()->alloc(sizeof(*table));
+    auto table = (Table *) sw_mem_pool()->alloc(sizeof(Table));
     if (table == nullptr) {
         return nullptr;
     }
@@ -55,22 +55,13 @@ Table *Table::make(uint32_t rows_size, float conflict_proportion) {
     return table;
 }
 
-void Table::free() {
-    delete mutex;
-    if (iterator) {
-        delete iterator;
-    }
-    delete column_map;
-    delete column_list;
-}
-
 bool Table::add_column(const std::string &_name, enum TableColumn::Type _type, size_t _size) {
     if (_type < TableColumn::TYPE_INT || _type > TableColumn::TYPE_STRING) {
         swoole_warning("unknown column type");
         return false;
     }
 
-    TableColumn *col = new TableColumn(_name, _type, _size);
+    auto col = new TableColumn(_name, _type, _size);
     col->index = item_size;
     item_size += col->size;
     column_map->emplace(_name, col);
@@ -79,10 +70,7 @@ bool Table::add_column(const std::string &_name, enum TableColumn::Type _type, s
     return true;
 }
 
-size_t Table::get_memory_size() {
-    if (memory_size > 0) {
-        return memory_size;
-    }
+size_t Table::calc_memory_size() const {
     /**
      * table size + conflict size
      */
@@ -108,11 +96,13 @@ size_t Table::get_memory_size() {
      */
     _memory_size += size * sizeof(TableRow *);
 
-    memory_size = _memory_size;
-
     swoole_trace("_memory_size=%lu, _row_num=%lu, _row_memory_size=%lu", _memory_size, _row_num, _row_memory_size);
 
     return _memory_size;
+}
+
+size_t Table::get_memory_size() const {
+    return memory_size;
 }
 
 uint32_t Table::get_available_slice_num() {
@@ -131,7 +121,7 @@ bool Table::create() {
         return false;
     }
 
-    size_t _memory_size = get_memory_size();
+    size_t _memory_size = calc_memory_size();
     size_t _row_memory_size = sizeof(TableRow) + item_size;
 
     void *_memory = sw_shm_malloc(_memory_size);
@@ -153,6 +143,7 @@ bool Table::create() {
     _memory_size -= _row_memory_size * size;
     pool = new FixedPool(_row_memory_size, _memory, _memory_size, true);
     iterator = new TableIterator(_row_memory_size);
+    memory_size = _memory_size;
     created = true;
 
     return true;
@@ -174,9 +165,7 @@ void Table::destroy() {
     }
     delete column_map;
     delete column_list;
-    if (iterator) {
-        delete iterator;
-    }
+    delete iterator;
     delete pool;
     if (memory) {
         sw_shm_free(memory);

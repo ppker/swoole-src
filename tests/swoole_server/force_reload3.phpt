@@ -8,6 +8,7 @@ error_reporting(0);
 require __DIR__ . '/../include/bootstrap.php';
 
 use Swoole\Server;
+use Swoole\Timer;
 
 $atomic = new Swoole\Atomic(1);
 
@@ -23,7 +24,7 @@ $pm->parentFunc = function ($pid) use ($pm,$argv) {
 $pm->childFunc = function () use ($pm,$atomic) {
     $flag = 0;
     $flag1 = 0;
-    $serv = new Server('127.0.0.1', $pm->getFreePort());
+    $serv = new Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $serv->set([
         'log_file' => TEST_LOG_FILE,
         "worker_num" => 2,
@@ -32,7 +33,7 @@ $pm->childFunc = function () use ($pm,$atomic) {
     ]);
     $serv->on("WorkerStart", function (Server $server, $worker_id) use ($pm, $atomic) {
         $pm->wakeup();
-        $server->after(50,function() use ($server, $worker_id, $atomic){
+        Timer::after(50,function() use ($server, $worker_id, $atomic){
             if ($atomic->get() == 1) {
                 $atomic->add(1);
                 $server->reload();

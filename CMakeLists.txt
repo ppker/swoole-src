@@ -1,12 +1,12 @@
 PROJECT(libswoole)
+cmake_minimum_required(VERSION 2.8.12)
 
 ENABLE_LANGUAGE(ASM)
-set(SWOOLE_VERSION 5.0.0-dev)
+set(SWOOLE_VERSION 6.0.0)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -Wall -g")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
-cmake_minimum_required(VERSION 2.8)
 
 file(READ ./config.h SWOOLE_CONFIG_FILE)
 
@@ -50,6 +50,8 @@ file(GLOB_RECURSE SRC_LIST FOLLOW_SYMLINKS src/*.c src/*.cc
             thirdparty/hiredis/net.c
             thirdparty/hiredis/read.c
             thirdparty/hiredis/sds.c
+            thirdparty/swoole_http_parser.c
+        	thirdparty/multipart_parser.c
 )
 file(GLOB_RECURSE HEAD_FILES FOLLOW_SYMLINKS include/*.h)
 file(GLOB_RECURSE HEAD_WAPPER_FILES FOLLOW_SYMLINKS include/wrapper/*.hpp)
@@ -98,6 +100,11 @@ if (DEFINED enable_trace_log)
 	add_definitions(-DSW_LOG_TRACE_OPEN)
 endif()
 
+if (DEFINED enable_asan)
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+endif()
+
 execute_process(COMMAND php-config --includes OUTPUT_VARIABLE PHP_INCLUDES OUTPUT_STRIP_TRAILING_WHITESPACE)
 execute_process(COMMAND php-config --extension-dir OUTPUT_VARIABLE PHP_EXTENSION_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${PHP_INCLUDES}")
@@ -120,7 +127,8 @@ link_directories(${LIBRARY_OUTPUT_PATH})
 add_library(lib-swoole SHARED ${SRC_LIST})
 set_target_properties(lib-swoole PROPERTIES OUTPUT_NAME "swoole" VERSION ${SWOOLE_VERSION})
 target_link_libraries(lib-swoole ${SWOOLE_LINK_LIBRARIES})
-if(CODE_COVERAGE)
+
+if (CODE_COVERAGE)
     target_link_libraries(lib-swoole coverage_config gcov)
 endif(CODE_COVERAGE)
 
@@ -146,8 +154,6 @@ set(ext_src_list  ${ext_cxx_files}
         thirdparty/php/sockets/conversions.cc
         thirdparty/php/sockets/sockaddr_conv.cc
         thirdparty/php/standard/proc_open.cc
-        thirdparty/swoole_http_parser.c
-        thirdparty/multipart_parser.c
         thirdparty/nghttp2/nghttp2_hd.c
         thirdparty/nghttp2/nghttp2_rcbuf.c
         thirdparty/nghttp2/nghttp2_helper.c
@@ -161,7 +167,20 @@ set_target_properties(ext-swoole PROPERTIES PREFIX "")
 set_target_properties(ext-swoole PROPERTIES OUTPUT_NAME "swoole")
 add_dependencies(ext-swoole lib-swoole)
 
-target_link_libraries(ext-swoole swoole)
+if (DEFINED enable_thread)
+    add_definitions(-DSW_THREAD)
+endif()
+
+# find libpq
+if (DEFINED libpq_dir)
+    target_include_directories(ext-swoole BEFORE ${LIBPQ_INCLUDE_DIRS})
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBPQ REQUIRED libpq)
+    target_include_directories(ext-swoole PRIVATE ${LIBPQ_INCLUDE_DIRS})
+endif()
+
+target_link_libraries(ext-swoole swoole pq)
 
 # install
 INSTALL(TARGETS ext-swoole LIBRARY DESTINATION ${PHP_EXTENSION_DIR})

@@ -113,6 +113,10 @@ bool file_put_contents(const std::string &filename, const char *content, size_t 
     return file.write_all(content, length);
 }
 
+bool file_exists(const std::string &filename) {
+    return access(filename.c_str(), F_OK) == 0;
+}
+
 size_t File::write_all(const void *data, size_t len) {
     size_t written_bytes = 0;
     while (written_bytes < len) {
@@ -155,6 +159,25 @@ size_t File::read_all(void *buf, size_t len) {
             break;
         }
     }
+    return read_bytes;
+}
+
+ssize_t File::read_line(void *__buf, size_t __n) {
+    char *buf = (char *) __buf;
+    auto offset = get_offset();
+    ssize_t read_bytes = read(buf, __n - 1);
+    if (read_bytes <= 0) {
+        return read_bytes;
+    }
+    for (ssize_t i = 0; i < read_bytes; ++i) {
+        if (buf[i] == '\0' || buf[i] == '\n') {
+            buf[i + 1] = '\0';
+            set_offset(offset + i + 1);
+            return i + 1;
+        }
+    }
+    buf[read_bytes] = '\0';
+    set_offset(offset + read_bytes + 1);
     return read_bytes;
 }
 

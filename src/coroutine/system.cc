@@ -19,12 +19,18 @@
 #include "swoole_lru_cache.h"
 #include "swoole_signal.h"
 
+#ifdef SW_USE_IOURING
+#include "swoole_iouring.h"
+using swoole::Iouring;
+#endif
+
 namespace swoole {
 namespace coroutine {
 
 static size_t dns_cache_capacity = 1000;
 static time_t dns_cache_expire = 60;
 static LRUCache *dns_cache = nullptr;
+static std::unordered_map<void *, long> async_resource_map;
 
 void System::set_dns_cache_expire(time_t expire) {
     dns_cache_expire = expire;
@@ -136,21 +142,8 @@ ssize_t System::write_file(const char *file, char *buf, size_t length, bool lock
 
 std::string gethostbyname_impl_with_async(const std::string &hostname, int domain, double timeout) {
     AsyncEvent ev{};
-
-    if (hostname.size() < SW_IP_MAX_LENGTH) {
-        ev.nbytes = SW_IP_MAX_LENGTH + 1;
-    } else {
-        ev.nbytes = hostname.size() + 1;
-    }
-
-    ev.buf = sw_malloc(ev.nbytes);
-    if (!ev.buf) {
-        return "";
-    }
-
-    memcpy(ev.buf, hostname.c_str(), hostname.size());
-    ((char *) ev.buf)[hostname.size()] = 0;
-    ev.flags = domain;
+    auto req = new GethostbynameRequest(hostname, domain);
+    ev.data = std::shared_ptr<AsyncRequest>(req);
     ev.retval = 1;
 
     coroutine::async(async::handler_gethostbyname, ev, timeout);
@@ -162,8 +155,7 @@ std::string gethostbyname_impl_with_async(const std::string &hostname, int domai
         swoole_set_last_error(ev.error);
         return "";
     } else {
-        std::string addr((char *) ev.buf);
-        sw_free(ev.buf);
+        std::string addr(req->addr);
         return addr;
     }
 }
@@ -212,103 +204,103 @@ std::vector<std::string> System::getaddrinfo(
     assert(family == AF_INET || family == AF_INET6);
 
     AsyncEvent ev{};
-    network::GetaddrinfoRequest req{};
-
-    ev.req = &req;
-
-    struct sockaddr_in6 result_buffer[SW_DNS_HOST_BUFFER_SIZE];
-
-    req.hostname = hostname.c_str();
-    req.family = family;
-    req.socktype = socktype;
-    req.protocol = protocol;
-    req.service = service.empty() ? nullptr : service.c_str();
-    req.result = result_buffer;
+    auto req = new GetaddrinfoRequest(hostname, family, socktype, protocol, service);
+    ev.data = std::shared_ptr<AsyncRequest>(req);
 
     coroutine::async(async::handler_getaddrinfo, ev, timeout);
 
     std::vector<std::string> retval;
 
-    if (ev.retval == -1 || req.error != 0) {
+    if (ev.retval == -1 || req->error != 0) {
         if (ev.error == SW_ERROR_AIO_TIMEOUT) {
             ev.error = SW_ERROR_DNSLOOKUP_RESOLVE_TIMEOUT;
         }
         swoole_set_last_error(ev.error);
     } else {
-        req.parse_result(retval);
+        req->parse_result(retval);
     }
 
     return retval;
 }
 
+struct SignalListener {
+    Coroutine *co;
+    int signo;
+};
+
+/**
+ * Only the main thread should listen for signals,
+ * without modifying it to a thread-local variable.
+ */
+static SignalListener *listeners[SW_SIGNO_MAX];
+
+int System::wait_signal(int signal, double timeout) {
+    std::vector<int> signals = {signal};
+    return wait_signal(signals, timeout);
+}
+
 /**
  * @error: swoole_get_last_error()
  */
-bool System::wait_signal(int signo, double timeout) {
-    static Coroutine *listeners[SW_SIGNO_MAX];
-    Coroutine *co = Coroutine::get_current_safe();
+int System::wait_signal(const std::vector<int> &signals, double timeout) {
+    SignalListener listener = {
+        Coroutine::get_current_safe(),
+        -1,
+    };
 
     if (SwooleTG.signal_listener_num > 0) {
         swoole_set_last_error(EBUSY);
-        return false;
-    }
-    if (signo < 0 || signo >= SW_SIGNO_MAX || signo == SIGCHLD) {
-        swoole_set_last_error(EINVAL);
-        return false;
+        return -1;
     }
 
-    /* resgiter signal */
-    listeners[signo] = co;
+    auto callback_fn = [](int signo) {
+        auto listener = listeners[signo];
+        if (listener) {
+            listeners[signo] = nullptr;
+            listener->signo = signo;
+            listener->co->resume();
+        }
+    };
+
+    for (auto &signo : signals) {
+        if (signo < 0 || signo >= SW_SIGNO_MAX || signo == SIGCHLD) {
+            swoole_set_last_error(EINVAL);
+            return -1;
+        }
+
+        /* resgiter signal */
+        listeners[signo] = &listener;
+
+#ifdef SW_USE_THREAD_CONTEXT
+        swoole_event_defer([signo, &callback_fn](void *) { swoole_signal_set(signo, callback_fn); }, nullptr);
+#else
+        swoole_signal_set(signo, callback_fn);
+#endif
+    }
+
     // exit condition
     if (!sw_reactor()->isset_exit_condition(Reactor::EXIT_CONDITION_CO_SIGNAL_LISTENER)) {
         sw_reactor()->set_exit_condition(
             Reactor::EXIT_CONDITION_CO_SIGNAL_LISTENER,
             [](Reactor *reactor, size_t &event_num) -> bool { return SwooleTG.co_signal_listener_num == 0; });
     }
-    swoole_signal_set(signo, [](int signo) {
-        Coroutine *co = listeners[signo];
-        if (co) {
-            listeners[signo] = nullptr;
-            co->resume();
-        }
-    });
+
     SwooleTG.co_signal_listener_num++;
 
-    TimerNode *timer = nullptr;
-    if (timeout > 0) {
-        timer = swoole_timer_add(
-            timeout * 1000,
-            0,
-            [](Timer *timer, TimerNode *tnode) {
-                Coroutine *co = (Coroutine *) tnode->data;
-                co->resume();
-            },
-            co);
+    bool retval = listener.co->yield_ex(timeout);
+
+    for (auto &signo : signals) {
+#ifdef SW_USE_THREAD_CONTEXT
+        swoole_event_defer([signo](void *) { swoole_signal_set(signo, nullptr); }, nullptr);
+#else
+        swoole_signal_set(signo, nullptr);
+#endif
+        listeners[signo] = nullptr;
     }
 
-    Coroutine::CancelFunc cancel_fn = [timer](Coroutine *co) {
-        if (timer) {
-            swoole_timer_del(timer);
-        }
-        co->resume();
-        return true;
-    };
-    co->yield(&cancel_fn);
-
-    swoole_signal_set(signo, nullptr);
     SwooleTG.co_signal_listener_num--;
 
-    if (listeners[signo] != nullptr) {
-        listeners[signo] = nullptr;
-        swoole_set_last_error(co->is_canceled() ? SW_ERROR_CO_CANCELED : ETIMEDOUT);
-        return false;
-    }
-
-    if (timer) {
-        swoole_timer_del(timer);
-    }
-
-    return !co->is_canceled();
+    return retval ? listener.signo : -1;
 }
 
 struct CoroPollTask {
@@ -391,7 +383,7 @@ static int socket_poll_error_callback(Reactor *reactor, Event *event) {
     return SW_OK;
 }
 
-static int translate_events_to_poll(int events) {
+int translate_events_to_poll(int events) {
     int poll_events = 0;
 
     if (events & SW_EVENT_READ) {
@@ -404,7 +396,7 @@ static int translate_events_to_poll(int events) {
     return poll_events;
 }
 
-static int translate_events_from_poll(int events) {
+int translate_events_from_poll(int events) {
     int sw_events = 0;
 
     if (events & POLLIN) {
@@ -465,7 +457,7 @@ bool System::socket_poll(std::unordered_map<int, PollSocket> &fds, double timeou
     }
 
     if (timeout > 0) {
-        task.timer = swoole_timer_add((long) (timeout * 1000), false, socket_poll_timeout, &task);
+        task.timer = swoole_timer_add(timeout, false, socket_poll_timeout, &task);
     }
 
     task.co->yield();
@@ -502,15 +494,16 @@ struct EventWaiter {
         }
 
         if (timeout > 0) {
-            timer = swoole_timer_add((long) (timeout * 1000),
-                                     false,
-                                     [](Timer *timer, TimerNode *tnode) {
-                                         EventWaiter *waiter = (EventWaiter *) tnode->data;
-                                         waiter->timer = nullptr;
-                                         waiter->error_ = ETIMEDOUT;
-                                         waiter->co->resume();
-                                     },
-                                     this);
+            timer = swoole_timer_add(
+                timeout,
+                false,
+                [](Timer *timer, TimerNode *tnode) {
+                    EventWaiter *waiter = (EventWaiter *) tnode->data;
+                    waiter->timer = nullptr;
+                    waiter->error_ = ETIMEDOUT;
+                    waiter->co->resume();
+                },
+                this);
         }
 
         co->yield(&cancel_fn);
@@ -596,6 +589,35 @@ int System::wait_event(int fd, int events, double timeout) {
     return revents;
 }
 
+bool System::exec(const char *command, bool get_error_stream, std::shared_ptr<String> buffer, int *status) {
+    Coroutine::get_current_safe();
+
+    pid_t pid;
+    int fd = swoole_shell_exec(command, &pid, get_error_stream);
+    if (fd < 0) {
+        swoole_sys_warning("Unable to execute '%s'", command);
+        return false;
+    }
+
+    Socket socket(fd, SW_SOCK_UNIX_STREAM);
+    while (1) {
+        ssize_t retval = socket.read(buffer->str + buffer->length, buffer->size - buffer->length);
+        if (retval > 0) {
+            buffer->length += retval;
+            if (buffer->length == buffer->size) {
+                if (!buffer->extend()) {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    socket.close();
+
+    return System::waitpid_safe(pid, status, 0) == pid;
+}
+
 void System::init_reactor(Reactor *reactor) {
     reactor->set_handler(SW_FD_CO_POLL | SW_EVENT_READ, socket_poll_read_callback);
     reactor->set_handler(SW_FD_CO_POLL | SW_EVENT_WRITE, socket_poll_write_callback);
@@ -606,6 +628,9 @@ void System::init_reactor(Reactor *reactor) {
     reactor->set_handler(SW_FD_CO_EVENT | SW_EVENT_ERROR, event_waiter_error_callback);
 
     reactor->set_handler(SW_FD_AIO | SW_EVENT_READ, AsyncThreads::callback);
+#ifdef SW_USE_IOURING
+    reactor->set_handler(SW_FD_IOURING | SW_EVENT_READ, Iouring::callback);
+#endif
 }
 
 static void async_task_completed(AsyncEvent *event) {
@@ -638,7 +663,7 @@ bool async(async::Handler handler, AsyncEvent &event, double timeout) {
         return false;
     } else {
         event.canceled = _ev->canceled;
-        event.error =  errno = _ev->error;
+        event.error = errno = _ev->error;
         event.retval = _ev->retval;
         return true;
     }
@@ -657,14 +682,11 @@ static void async_lambda_handler(AsyncEvent *event) {
 }
 
 static void async_lambda_callback(AsyncEvent *event) {
-    if (event->canceled) {
-        return;
-    }
     AsyncLambdaTask *task = reinterpret_cast<AsyncLambdaTask *>(event->object);
     task->co->resume();
 }
 
-bool async(const std::function<void(void)> &fn, double timeout) {
+bool async(const std::function<void(void)> &fn) {
     AsyncEvent event{};
     AsyncLambdaTask task{Coroutine::get_current_safe(), fn};
 
@@ -677,14 +699,46 @@ bool async(const std::function<void(void)> &fn, double timeout) {
         return false;
     }
 
-    if (!task.co->yield_ex(timeout)) {
-        _ev->canceled = true;
-        errno = swoole_get_last_error();
-        return false;
-    } else {
-        errno = _ev->error;
-        return true;
+    task.co->yield();
+    errno = _ev->error;
+    return true;
+}
+
+AsyncLock::AsyncLock(void *resource) {
+    resource_ = resource;
+    async_resource_map.emplace(resource, Coroutine::get_current_cid());
+}
+
+AsyncLock::~AsyncLock() {
+    async_resource_map.erase(resource_);
+}
+
+std::shared_ptr<AsyncLock> async_lock(void *resource) {
+    auto iter = async_resource_map.find(resource);
+    if (iter != async_resource_map.end()) {
+        swoole_fatal_error(SW_ERROR_CO_HAS_BEEN_BOUND,
+                           "resource(%p) has already been bound to another coroutine#%ld, "
+                           "%s of the same resource in coroutine#%ld at the same time is not allowed",
+                           resource,
+                           *iter,
+                           Coroutine::get_current_cid());
+        return nullptr;
     }
+    return std::make_shared<AsyncLock>(resource);
+}
+
+bool wait_for(const std::function<bool(void)> &fn) {
+    double second = 0.001;
+    while (true) {
+        if (fn()) {
+            break;
+        }
+        if (System::sleep(second) != SW_OK) {
+            return false;
+        }
+        second *= 2;
+    }
+    return true;
 }
 
 }  // namespace coroutine

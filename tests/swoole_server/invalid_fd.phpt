@@ -12,10 +12,8 @@ $pm->parentFunc = function () use ($pm) {
     go(function () use ($pm) {
         $client = new Co\Client(SWOOLE_SOCK_TCP);
         Assert::assert($client->connect('127.0.0.1', $pm->getFreePort()));
-        Assert::assert($client->send('null' . EOF));
-        Assert::assert($client->send('-1' . EOF));
-        Assert::assert($client->send('100' . EOF));
-        Assert::assert($client->send(PHP_INT_MAX . EOF));
+        Assert::notEmpty($client->send("TEST" . EOF));
+        Assert::notEmpty($client->recv());
         switch_process();
         $pm->kill();
     });
@@ -31,9 +29,11 @@ $pm->childFunc = function () use ($pm) {
         $pm->wakeup();
     });
     $server->on('receive', function (Swoole\Server $serv, int $fd, int $rid, string $data) {
-        $to_fd = null;
-        eval("\$to_fd = ${data};");
-        $serv->send($to_fd, "hello {$fd}" . EOF);
+        Assert::false($serv->send(null, "hello {$fd}"));
+        Assert::false($serv->send(-1, "hello {$fd}"));
+        Assert::false($serv->send(100, "hello {$fd}"));
+        Assert::false($serv->send(PHP_INT_MAX, "hello {$fd}"));
+        Assert::true($serv->send($fd, "DONE\n"));
     });
     $server->start();
 };
@@ -44,5 +44,3 @@ $pm->run();
 Warning: Swoole\Server::send(): fd can not be null in %s/tests/swoole_server/invalid_fd.php on line %d
 
 Warning: Swoole\Server::send(): invalid fd[-1] in %s/tests/swoole_server/invalid_fd.php on line %d
-[%s]	NOTICE	Server::send_to_connection() (ERRNO 1005): send %d byte failed, session#100 does not exist
-[%s]	NOTICE	Server::send_to_connection() (ERRNO 1005): send %d byte failed, session#9223372036854775807 does not exist

@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -49,9 +49,7 @@ TEST(coroutine_system, flock) {
     ASSERT_EQ(swoole_random_bytes(buf->str, buf->size - 1), buf->size - 1);
     buf->str[buf->size - 1] = 0;
 
-    swoole_event_init(SW_EVENTLOOP_WAIT_EXIT);
-
-    Coroutine::create([&buf](void *) {
+    test::coroutine::run([&buf](void *) {
         int fd = swoole_coroutine_open(test_file, File::WRITE | File::CREATE, 0666);
         ASSERT_TRUE(fd > 0);
         swoole_coroutine_flock_ex(test_file, fd, LOCK_EX);
@@ -77,7 +75,6 @@ TEST(coroutine_system, flock) {
         swoole_coroutine_close(fd);
     });
 
-    swoole_event_wait();
     unlink(test_file);
 }
 
@@ -124,8 +121,8 @@ TEST(coroutine_system, wait_signal) {
             System::sleep(0.002);
             kill(getpid(), SIGUSR1);
         });
-        ASSERT_TRUE(System::wait_signal(SIGUSR1, 1.0));
-        ASSERT_FALSE(System::wait_signal(SIGUSR2, 0.1));
+        ASSERT_EQ(System::wait_signal(SIGUSR1, 1.0), SIGUSR1);
+        ASSERT_EQ(System::wait_signal(SIGUSR2, 0.1), -1);
     });
 }
 
@@ -270,5 +267,14 @@ TEST(coroutine_system, timeout_is_zero) {
         auto pipe_sock = p.get_socket(false);
         result = System::wait_event(pipe_sock->get_fd(), SW_EVENT_READ, 0);
         ASSERT_TRUE(result);
+    });
+}
+
+TEST(coroutine_system, exec) {
+    test::coroutine::run([](void *arg) {
+        int status;
+        auto buffer = std::shared_ptr<String>(swoole::make_string(1024));
+        ASSERT_TRUE(System::exec("ls /", true, buffer, &status));
+        ASSERT_TRUE(buffer->contains(SW_STRL("tmp")));
     });
 }

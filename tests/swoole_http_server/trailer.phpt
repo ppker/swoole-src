@@ -16,7 +16,7 @@ $pm->parentFunc = function () use ($pm) {
     });
 };
 $pm->childFunc = function () use ($pm) {
-    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort());
+    $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
 
     $http->set([
         'worker_num' => 1,
@@ -30,9 +30,9 @@ $pm->childFunc = function () use ($pm) {
     $http->on('request', function (Swoole\Http\Request $request, Swoole\Http\Response $response) {
         $response->header('trailer', 'Content-MD5');
         $data = 'hello world';
-        $response->write($data);
-        $response->trailer('Content-MD5', md5($data));
-        $response->end();
+        Assert::true($response->write($data));
+        Assert::true($response->trailer('Content-MD5', md5($data)));
+        Assert::true($response->end());
     });
     $http->start();
 };

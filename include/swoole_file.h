@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -30,6 +30,7 @@ ssize_t file_get_size(int fd);
 ssize_t file_get_size(const std::string &filename);
 std::shared_ptr<String> file_get_contents(const std::string &filename);
 bool file_put_contents(const std::string &filename, const char *content, size_t length);
+bool file_exists(const std::string &filename);
 
 typedef struct stat FileStatus;
 
@@ -100,6 +101,14 @@ class File {
 
     size_t write_all(const void *__buf, size_t __n);
     size_t read_all(void *__buf, size_t __n);
+    /**
+     * Read one line of file, reading ends when __n - 1 bytes have been read,
+     * or a newline (which is included in the return value),
+     * or an EOF (read bytes less than __n)
+     * Returns length of line on sucess, -1 otherwise.
+     * NOTE: `buf' must be end with zero.
+     */
+    ssize_t read_line(void *__buf, size_t __n);
 
     std::shared_ptr<String> read_content();
 
@@ -120,7 +129,7 @@ class File {
         return ::ftruncate(fd_, size) == 0;
     }
 
-    off_t set_offest(off_t offset) {
+    off_t set_offset(off_t offset) {
         return lseek(fd_, offset, SEEK_SET);
     }
 

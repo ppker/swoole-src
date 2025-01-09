@@ -24,29 +24,49 @@
 SW_EXTERN_C_BEGIN
 #include <curl/curl.h>
 #include <curl/multi.h>
+#if PHP_VERSION_ID >= 80400
+#include "thirdparty/php84/curl/curl_private.h"
+#else
 #include "thirdparty/php/curl/curl_private.h"
+#endif
 SW_EXTERN_C_END
 
 #if LIBCURL_VERSION_NUM < 0x073800
 #error "require cURL version 7.56.0 or later"
 #endif
 
+CURLcode swoole_curl_easy_perform(CURL *cp);
+php_curl *swoole_curl_get_handle(zval *zid, bool exclusive = true, bool required = true);
+
 namespace swoole {
-
-using network::Socket;
-
 namespace curl {
 
 class Multi;
 
-struct Handle {
-    CURL *cp;
-    Socket *socket;
-    Multi *multi;
+struct HandleSocket {
+    network::Socket *socket;
     int event_bitmask;
     int event_fd;
     int action;
 };
+
+struct Handle {
+    CURL *cp;
+    Multi *multi;
+    std::unordered_map<int, HandleSocket *> sockets;
+
+    Handle(CURL *_cp) {
+        cp = _cp;
+        multi = nullptr;
+    }
+
+    HandleSocket *create_socket(curl_socket_t sockfd);
+    void destroy_socket(curl_socket_t sockfd);
+};
+
+Handle *get_handle(CURL *cp);
+Handle *create_handle(CURL *ch);
+void destroy_handle(CURL *ch);
 
 struct Selector {
     bool timer_callback = false;
@@ -66,16 +86,10 @@ class Multi {
 
     CURLcode read_info();
 
-    Socket *create_socket(CURL *cp, curl_socket_t sockfd);
+    HandleSocket *create_socket(Handle *handle, curl_socket_t sockfd);
 
-    Handle *get_handle(CURL *cp) {
-        Handle *handle = nullptr;
-        curl_easy_getinfo(cp, CURLINFO_PRIVATE, &handle);
-        return handle;
-    }
-
-    void set_event(CURL *easy, void *socket_ptr, curl_socket_t sockfd, int action);
-    void del_event(CURL *easy, void *socket_ptr, curl_socket_t sockfd);
+    void set_event(CURL *cp, void *socket_ptr, curl_socket_t sockfd, int action);
+    void del_event(CURL *cp, void *socket_ptr, curl_socket_t sockfd);
 
     void add_timer(long timeout_ms) {
         if (timer && swoole_timer_is_available()) {
@@ -113,6 +127,7 @@ class Multi {
     }
 
     ~Multi() {
+        del_timer();
         curl_multi_cleanup(multi_handle_);
     }
 
@@ -128,8 +143,8 @@ class Multi {
         selector.reset(_selector);
     }
 
-    CURLMcode add_handle(CURL *cp);
-    CURLMcode remove_handle(CURL *cp);
+    CURLMcode add_handle(Handle *handle);
+    CURLMcode remove_handle(Handle *handle);
 
     CURLMcode perform() {
         return curl_multi_perform(multi_handle_, &running_handles_);
@@ -147,9 +162,9 @@ class Multi {
         return Coroutine::get_current_safe();
     }
 
-    CURLcode exec(php_curl *ch);
+    CURLcode exec(Handle *handle);
     long select(php_curlm *mh, double timeout = -1);
-    void callback(Handle *handle, int event_bitmask);
+    void callback(Handle *handle, int event_bitmask, int sockfd = -1);
 
     static int cb_readable(Reactor *reactor, Event *event);
     static int cb_writable(Reactor *reactor, Event *event);

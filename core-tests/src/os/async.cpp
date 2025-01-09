@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -78,10 +78,16 @@ TEST(async, schedule) {
             count--;
             if (count == 0) {
                 swoole_timer_del(timer);
-                ASSERT_EQ(SwooleTG.async_threads->get_worker_num(), 128);
+                ASSERT_GT(SwooleTG.async_threads->get_worker_num(), 16);
                 ASSERT_GT(SwooleTG.async_threads->get_queue_size(), 100);
                 ASSERT_GT(SwooleTG.async_threads->get_task_num(), 100);
                 break;
+            } else if (count == N - 1) {
+                ASSERT_EQ(SwooleTG.async_threads->get_worker_num(), 4);
+                ASSERT_LE(SwooleTG.async_threads->get_queue_size(), 1);
+                ASSERT_EQ(SwooleTG.async_threads->get_task_num(), 1);
+            } else if (count < N / 2) {
+                ASSERT_GT(SwooleTG.async_threads->get_worker_num(), 4);
             }
         }
     });

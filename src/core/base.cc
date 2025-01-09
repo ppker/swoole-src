@@ -97,19 +97,11 @@ static ssize_t getrandom(void *buffer, size_t size, unsigned int __flags) {
 #endif
 
 swoole::Global SwooleG = {};
-__thread swoole::ThreadGlobal SwooleTG = {};
+thread_local swoole::ThreadGlobal SwooleTG = {};
+thread_local char sw_error[SW_ERROR_MSG_SIZE];
+std::mutex sw_thread_lock;
 
-static std::unordered_map<std::string, void *> functions;
 static swoole::Logger *g_logger_instance = nullptr;
-
-#ifdef __MACH__
-static __thread char _sw_error_buf[SW_ERROR_MSG_SIZE];
-char *sw_error_() {
-    return _sw_error_buf;
-}
-#else
-__thread char sw_error[SW_ERROR_MSG_SIZE];
-#endif
 
 static void swoole_fatal_error_impl(int code, const char *format, ...);
 
@@ -148,7 +140,6 @@ static void bug_report_message_init() {
 
 #ifdef SW_USE_OPENSSL
     SwooleG.bug_report_message += swoole_ssl_get_version_message();
-
 #endif
 }
 
@@ -162,6 +153,7 @@ void swoole_init(void) {
 
     SwooleG.running = 1;
     SwooleG.init = 1;
+    SwooleG.enable_coroutine = 1;
     SwooleG.std_allocator = {malloc, calloc, realloc, free};
     SwooleG.fatal_error = swoole_fatal_error_impl;
     SwooleG.cpu_num = SW_MAX(1, sysconf(_SC_NPROCESSORS_ONLN));
@@ -216,27 +208,6 @@ void swoole_init(void) {
 
 SW_EXTERN_C_BEGIN
 
-SW_API int swoole_add_function(const char *name, void *func) {
-    std::string _name(name);
-    auto iter = functions.find(_name);
-    if (iter != functions.end()) {
-        swoole_warning("Function '%s' has already been added", name);
-        return SW_ERR;
-    } else {
-        functions.emplace(std::make_pair(_name, func));
-        return SW_OK;
-    }
-}
-
-SW_API void *swoole_get_function(const char *name, uint32_t length) {
-    auto iter = functions.find(std::string(name, length));
-    if (iter != functions.end()) {
-        return iter->second;
-    } else {
-        return nullptr;
-    }
-}
-
 SW_API int swoole_add_hook(enum swGlobalHookType type, swHookFunc func, int push_back) {
     assert(type <= SW_GLOBAL_HOOK_END);
     return swoole::hook_add(SwooleG.hooks, type, func, push_back);
@@ -284,6 +255,13 @@ void swoole_clean(void) {
         delete SwooleTG.buffer_stack;
         SwooleTG.buffer_stack = nullptr;
     }
+    SW_LOOP_N(SW_MAX_HOOK_TYPE) {
+        if (SwooleG.hooks[i]) {
+            auto hooks = static_cast<std::list<swoole::Callback> *>(SwooleG.hooks[i]);
+            delete hooks;
+        }
+    }
+    swoole_signal_clear();
     SwooleG = {};
 }
 
@@ -293,7 +271,21 @@ SW_API void swoole_set_log_level(int level) {
     }
 }
 
-SW_API void swoole_set_trace_flags(int flags) {
+SW_API int swoole_get_log_level() {
+    if (sw_logger()) {
+        return sw_logger()->get_level();
+    } else {
+        return SW_LOG_NONE;
+    }
+}
+
+SW_API void swoole_set_log_file(const char *file) {
+    if (sw_logger()) {
+        sw_logger()->open(file);
+    }
+}
+
+SW_API void swoole_set_trace_flags(long flags) {
     SwooleG.trace_flags = flags;
 }
 
@@ -347,6 +339,20 @@ bool swoole_set_task_tmpdir(const std::string &dir) {
     return true;
 }
 
+pid_t swoole_fork_exec(const std::function<void(void)> &fn) {
+    pid_t pid = fork();
+    switch (pid) {
+    case -1:
+        return false;
+    case 0:
+        fn();
+        exit(0);
+    default:
+        break;
+    }
+    return pid;
+}
+
 pid_t swoole_fork(int flags) {
     if (!(flags & SW_FORK_EXEC)) {
         if (swoole_coroutine_is_in()) {
@@ -397,9 +403,27 @@ pid_t swoole_fork(int flags) {
          * reset signal handler
          */
         swoole_signal_clear();
+
+        if (swoole_isset_hook(SW_GLOBAL_HOOK_AFTER_FORK)) {
+            swoole_call_hook(SW_GLOBAL_HOOK_AFTER_FORK, nullptr);
+        }
     }
 
     return pid;
+}
+
+void swoole_thread_init(void) {
+    if (!SwooleTG.buffer_stack) {
+        SwooleTG.buffer_stack = new String(SW_STACK_BUFFER_SIZE);
+    }
+    swoole_signal_block_all();
+}
+
+void swoole_thread_clean(void) {
+    if (SwooleTG.buffer_stack) {
+        delete SwooleTG.buffer_stack;
+        SwooleTG.buffer_stack = nullptr;
+    }
 }
 
 void swoole_dump_ascii(const char *data, size_t size) {
@@ -541,7 +565,7 @@ ulong_t swoole_hex2dec(const char *hex, size_t *parsed_bytes) {
 #endif
 
 int swoole_rand(int min, int max) {
-    static int _seed = 0;
+    static time_t _seed = 0;
     assert(max > min);
 
     if (_seed == 0) {
@@ -775,17 +799,25 @@ char *swoole_string_format(size_t n, const char *format, ...) {
     return nullptr;
 }
 
+static const char characters[] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+    'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+};
+
 void swoole_random_string(char *buf, size_t size) {
-    static char characters[] = {
-        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
-        'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
-        'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    };
     size_t i = 0;
     for (; i < size; i++) {
         buf[i] = characters[swoole_rand(0, sizeof(characters) - 1)];
     }
     buf[i] = '\0';
+}
+
+void swoole_random_string(std::string &str, size_t size) {
+    size_t i = 0;
+    for (; i < size; i++) {
+        str.append(1, characters[swoole_rand(0, sizeof(characters) - 1)]);
+    }
 }
 
 size_t swoole_random_bytes(char *buf, size_t size) {
@@ -862,7 +894,18 @@ static void swoole_fatal_error_impl(int code, const char *format, ...) {
     retval += sw_vsnprintf(sw_error + retval, SW_ERROR_MSG_SIZE - retval, format, args);
     va_end(args);
     sw_logger()->put(SW_LOG_ERROR, sw_error, retval);
-    exit(1);
+    swoole_exit(1);
+}
+
+void swoole_exit(int __status) {
+#ifdef SW_THREAD
+    /**
+     * If multiple threads call exit simultaneously, it can result in a crash.
+     * Implementing locking mechanisms can prevent concurrent calls to exit.
+     */
+    std::unique_lock<std::mutex> _lock(sw_thread_lock);
+#endif
+    exit(__status);
 }
 
 namespace swoole {
@@ -938,18 +981,13 @@ void hook_call(void **hooks, int type, void *arg) {
  * return the first file of the intersection, in order of vec1
  */
 std::string intersection(std::vector<std::string> &vec1, std::set<std::string> &vec2) {
-    std::string result = "";
-
-    std::find_if(vec1.begin(), vec1.end(), [&](std::string &str) -> bool {
-        auto iter = std::find(vec2.begin(), vec2.end(), str);
-        if (iter != vec2.end()) {
-            result = *iter;
-            return true;
+    for (const auto &vec1_item : vec1) {
+        if (vec2.find(vec1_item) != vec2.end()) {
+            return vec1_item;
         }
-        return false;
-    });
+    }
 
-    return result;
+    return "";
 }
 
 double microtime(void) {

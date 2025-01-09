@@ -17,6 +17,7 @@
  */
 
 #include "php_swoole_cxx.h"
+#include "php_swoole_process.h"
 
 #include "swoole_server.h"
 
@@ -36,7 +37,6 @@ static zend_object_handlers swoole_timer_handlers;
 static zend_class_entry *swoole_timer_iterator_ce;
 
 SW_EXTERN_C_BEGIN
-static PHP_FUNCTION(swoole_timer_set);
 static PHP_FUNCTION(swoole_timer_after);
 static PHP_FUNCTION(swoole_timer_tick);
 static PHP_FUNCTION(swoole_timer_exists);
@@ -50,7 +50,6 @@ SW_EXTERN_C_END
 // clang-format off
 static const zend_function_entry swoole_timer_methods[] =
 {
-    ZEND_FENTRY(set,      ZEND_FN(swoole_timer_set),       arginfo_swoole_timer_set,       ZEND_ACC_PUBLIC | ZEND_ACC_STATIC | ZEND_ACC_DEPRECATED)
     ZEND_FENTRY(tick,     ZEND_FN(swoole_timer_tick),      arginfo_swoole_timer_tick,      ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_FENTRY(after,    ZEND_FN(swoole_timer_after),     arginfo_swoole_timer_after,     ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_FENTRY(exists,   ZEND_FN(swoole_timer_exists),    arginfo_swoole_timer_exists,    ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -69,15 +68,35 @@ void php_swoole_timer_minit(int module_number) {
 
     SW_INIT_CLASS_ENTRY_BASE(swoole_timer_iterator, "Swoole\\Timer\\Iterator", nullptr, nullptr, spl_ce_ArrayIterator);
 
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "set", CG(function_table), "swoole_timer_set");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "after", CG(function_table), "swoole_timer_after");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "tick", CG(function_table), "swoole_timer_tick");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "exists", CG(function_table), "swoole_timer_exists");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "info", CG(function_table), "swoole_timer_info");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "stats", CG(function_table), "swoole_timer_stats");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "list", CG(function_table), "swoole_timer_list");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "clear", CG(function_table), "swoole_timer_clear");
-    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table, "clearAll", CG(function_table), "swoole_timer_clear_all");
+    SW_FUNCTION_ALIAS(
+        &swoole_timer_ce->function_table, "after", CG(function_table), "swoole_timer_after", arginfo_swoole_timer_tick);
+    SW_FUNCTION_ALIAS(
+        &swoole_timer_ce->function_table, "tick", CG(function_table), "swoole_timer_tick", arginfo_swoole_timer_after);
+    SW_FUNCTION_ALIAS(
+        &swoole_timer_ce->function_table, "info", CG(function_table), "swoole_timer_info", arginfo_swoole_timer_info);
+    SW_FUNCTION_ALIAS(
+        &swoole_timer_ce->function_table, "list", CG(function_table), "swoole_timer_list", arginfo_swoole_timer_list);
+
+    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table,
+                      "exists",
+                      CG(function_table),
+                      "swoole_timer_exists",
+                      arginfo_swoole_timer_exists);
+    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table,
+                      "stats",
+                      CG(function_table),
+                      "swoole_timer_stats",
+                      arginfo_swoole_timer_stats);
+    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table,
+                      "clear",
+                      CG(function_table),
+                      "swoole_timer_clear",
+                      arginfo_swoole_timer_clear);
+    SW_FUNCTION_ALIAS(&swoole_timer_ce->function_table,
+                      "clearAll",
+                      CG(function_table),
+                      "swoole_timer_clear_all",
+                      arginfo_swoole_timer_clear_all);
 
     SW_REGISTER_LONG_CONSTANT("SWOOLE_TIMER_MIN_MS", SW_TIMER_MIN_MS);
     SW_REGISTER_DOUBLE_CONSTANT("SWOOLE_TIMER_MIN_SEC", SW_TIMER_MIN_SEC);
@@ -130,6 +149,18 @@ static void timer_callback(Timer *timer, TimerNode *tnode) {
     }
 }
 
+static bool timer_if_use_reactor() {
+    auto server = sw_server();
+    if (server) {
+        return server->is_user_worker() || (server->is_task_worker() && server->task_enable_coroutine);
+    }
+    auto process_pool = sw_process_pool();
+    if (process_pool) {
+        return !process_pool->is_master();
+    }
+    return true;
+}
+
 static void timer_add(INTERNAL_FUNCTION_PARAMETERS, bool persistent) {
     zend_long ms;
     Function *fci = (Function *) ecalloc(1, sizeof(Function));
@@ -148,13 +179,11 @@ static void timer_add(INTERNAL_FUNCTION_PARAMETERS, bool persistent) {
         RETURN_FALSE;
     }
 
-    // no server || user worker || task process with async mode
-    if (!sw_server() || sw_server()->is_user_worker() ||
-        (sw_server()->is_task_worker() && sw_server()->task_enable_coroutine)) {
+    if (UNEXPECTED(!sw_reactor() && timer_if_use_reactor())) {
         php_swoole_check_reactor();
     }
 
-    tnode = swoole_timer_add(ms, persistent, timer_callback, fci);
+    tnode = swoole_timer_add((long) ms, persistent, timer_callback, fci);
     if (UNEXPECTED(!tnode)) {
         php_swoole_fatal_error(E_WARNING, "add timer failed");
         goto _failed;
@@ -179,21 +208,6 @@ static void timer_add(INTERNAL_FUNCTION_PARAMETERS, bool persistent) {
     }
     sw_zend_fci_cache_persist(&fci->fci_cache);
     RETURN_LONG(tnode->id);
-}
-
-static PHP_FUNCTION(swoole_timer_set) {
-    zval *zset = nullptr;
-    zval *ztmp;
-
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ARRAY(zset)
-    ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
-
-    HashTable *vht = Z_ARRVAL_P(zset);
-
-    if (php_swoole_array_get_value(vht, "enable_coroutine", ztmp)) {
-        SWOOLE_G(enable_coroutine) = zval_is_true(ztmp);
-    }
 }
 
 static PHP_FUNCTION(swoole_timer_after) {

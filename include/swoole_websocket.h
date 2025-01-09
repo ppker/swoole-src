@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -29,6 +29,7 @@
 #define SW_WEBSOCKET_CLOSE_CODE_LEN 2
 #define SW_WEBSOCKET_CLOSE_REASON_MAX_LEN 125
 #define SW_WEBSOCKET_OPCODE_MAX swoole::websocket::OPCODE_PONG
+#define SW_WEBSOCKET_MESSAGE_HEADER_SIZE (SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_MASK_LEN + sizeof(uint64_t))
 
 namespace swoole {
 namespace websocket {
@@ -99,6 +100,9 @@ enum CloseReason {
     CLOSE_MESSAGE_TOO_BIG = 1009,
     CLOSE_EXTENSION_MISSING = 1010,
     CLOSE_SERVER_ERROR = 1011,
+    CLOSE_SERVICE_RESTART = 1012,
+    CLOSE_TRY_AGAIN_LATER = 1013,
+    CLOSE_BAD_GATEWAY = 1014,
     CLOSE_TLS = 1015,
 };
 

@@ -49,8 +49,8 @@ static Lock *php_swoole_lock_get_ptr(zval *zobject) {
 
 static Lock *php_swoole_lock_get_and_check_ptr(zval *zobject) {
     Lock *lock = php_swoole_lock_get_ptr(zobject);
-    if (!lock) {
-        php_swoole_fatal_error(E_ERROR, "you must call Lock constructor first");
+    if (UNEXPECTED(!lock)) {
+        swoole_fatal_error(SW_ERROR_WRONG_OPERATION, "must call constructor first");
     }
     return lock;
 }
@@ -60,10 +60,6 @@ void php_swoole_lock_set_ptr(zval *zobject, Lock *ptr) {
 }
 
 static void php_swoole_lock_free_object(zend_object *object) {
-    LockObject *o = php_swoole_lock_fetch_object(object);
-    if (o->lock) {
-        delete o->lock;
-    }
     zend_object_std_dtor(object);
 }
 
@@ -84,7 +80,6 @@ static PHP_METHOD(swoole_lock, trylock);
 static PHP_METHOD(swoole_lock, lock_read);
 static PHP_METHOD(swoole_lock, trylock_read);
 static PHP_METHOD(swoole_lock, unlock);
-static PHP_METHOD(swoole_lock, destroy);
 SW_EXTERN_C_END
 
 // clang-format off
@@ -98,7 +93,6 @@ static const zend_function_entry swoole_lock_methods[] =
     PHP_ME(swoole_lock, lock_read,    arginfo_class_Swoole_Lock_lock_read,    ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, trylock_read, arginfo_class_Swoole_Lock_trylock_read, ZEND_ACC_PUBLIC)
     PHP_ME(swoole_lock, unlock,       arginfo_class_Swoole_Lock_unlock,       ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_lock, destroy,      arginfo_class_Swoole_Lock_destroy,      ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 // clang-format on
@@ -111,9 +105,7 @@ void php_swoole_lock_minit(int module_number) {
     SW_SET_CLASS_CUSTOM_OBJECT(
         swoole_lock, php_swoole_lock_create_object, php_swoole_lock_free_object, LockObject, std);
 
-    zend_declare_class_constant_long(swoole_lock_ce, ZEND_STRL("FILELOCK"), Lock::FILE_LOCK);
     zend_declare_class_constant_long(swoole_lock_ce, ZEND_STRL("MUTEX"), Lock::MUTEX);
-    zend_declare_class_constant_long(swoole_lock_ce, ZEND_STRL("SEM"), Lock::SEM);
 #ifdef HAVE_RWLOCK
     zend_declare_class_constant_long(swoole_lock_ce, ZEND_STRL("RWLOCK"), Lock::RW_LOCK);
 #endif
@@ -122,9 +114,7 @@ void php_swoole_lock_minit(int module_number) {
 #endif
     zend_declare_property_long(swoole_lock_ce, ZEND_STRL("errCode"), 0, ZEND_ACC_PUBLIC);
 
-    SW_REGISTER_LONG_CONSTANT("SWOOLE_FILELOCK", Lock::FILE_LOCK);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_MUTEX", Lock::MUTEX);
-    SW_REGISTER_LONG_CONSTANT("SWOOLE_SEM", Lock::SEM);
 #ifdef HAVE_RWLOCK
     SW_REGISTER_LONG_CONSTANT("SWOOLE_RWLOCK", Lock::RW_LOCK);
 #endif
@@ -149,12 +139,6 @@ static PHP_METHOD(swoole_lock, __construct) {
     }
 
     switch (type) {
-    case Lock::FILE_LOCK:
-    case Lock::SEM:
-        zend_throw_exception(
-            swoole_exception_ce, "FileLock and SemLock is no longer supported, please use mutex lock", errno);
-        RETURN_FALSE;
-        break;
 #ifdef HAVE_SPINLOCK
     case Lock::SPIN_LOCK:
         lock = new SpinLock(1);
@@ -166,8 +150,11 @@ static PHP_METHOD(swoole_lock, __construct) {
         break;
 #endif
     case Lock::MUTEX:
-    default:
         lock = new Mutex(Mutex::PROCESS_SHARED);
+        break;
+    default:
+        zend_throw_exception(swoole_exception_ce, "lock type[%d] is not support", type);
+        RETURN_FALSE;
         break;
     }
     php_swoole_lock_set_ptr(ZEND_THIS, lock);
@@ -184,9 +171,11 @@ static PHP_METHOD(swoole_lock, lock) {
 static PHP_METHOD(swoole_lock, lockwait) {
     double timeout = 1.0;
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS(), "d", &timeout) == FAILURE) {
-        RETURN_FALSE;
-    }
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_DOUBLE(timeout)
+    ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
+
     Lock *lock = php_swoole_lock_get_and_check_ptr(ZEND_THIS);
     if (lock->get_type() != Lock::MUTEX) {
         zend_throw_exception(swoole_exception_ce, "only mutex supports lockwait", -2);
@@ -218,10 +207,4 @@ static PHP_METHOD(swoole_lock, trylock_read) {
 static PHP_METHOD(swoole_lock, lock_read) {
     Lock *lock = php_swoole_lock_get_and_check_ptr(ZEND_THIS);
     SW_LOCK_CHECK_RETURN(lock->lock_rd());
-}
-
-static PHP_METHOD(swoole_lock, destroy) {
-    Lock *lock = php_swoole_lock_get_and_check_ptr(ZEND_THIS);
-    delete lock;
-    php_swoole_lock_set_ptr(ZEND_THIS, nullptr);
 }

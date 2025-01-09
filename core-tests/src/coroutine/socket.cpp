@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -23,6 +23,7 @@
 
 using namespace swoole::test;
 
+using swoole::Coroutine;
 using swoole::HttpProxy;
 using swoole::Protocol;
 using swoole::Socks5Proxy;
@@ -31,6 +32,8 @@ using swoole::coroutine::Socket;
 using swoole::coroutine::System;
 using swoole::network::Address;
 using swoole::network::IOVector;
+using swoole::test::create_http_proxy;
+using swoole::test::create_socks5_proxy;
 using swoole::test::Server;
 
 const std::string host = "www.baidu.com";
@@ -63,15 +66,34 @@ TEST(coroutine_socket, connect_with_dns) {
     });
 }
 
+TEST(coroutine_socket, tcp6) {
+    coroutine::run([](void *arg) {
+        Socket sock(SW_SOCK_TCP6);
+        bool retval = sock.connect("::1", 80);
+        ASSERT_EQ(retval, true);
+        ASSERT_EQ(sock.errCode, 0);
+    });
+}
+
+TEST(coroutine_socket, unixsock_fail) {
+    coroutine::run([](void *arg) {
+        Socket sock(SW_SOCK_UNIX_STREAM);
+        bool retval = sock.connect("/tmp/unix.sock");
+        ASSERT_EQ(retval, false);
+        ASSERT_EQ(sock.errCode, ENOENT);
+    });
+}
+
 TEST(coroutine_socket, recv_success) {
     pid_t pid;
+    int port = swoole::test::get_random_port();
 
-    Process proc([](Process *proc) {
+    Process proc([port](Process *proc) {
         on_receive_lambda_type receive_fn = [](ON_RECEIVE_PARAMS) {
             SERVER_THIS->send(req->info.fd, req->data, req->info.len);
         };
 
-        Server serv(TEST_HOST, TEST_PORT, swoole::Server::MODE_BASE, SW_SOCK_TCP);
+        Server serv(TEST_HOST, port, swoole::Server::MODE_BASE, SW_SOCK_TCP);
         serv.on("onReceive", (void *) receive_fn);
         serv.start();
     });
@@ -80,9 +102,9 @@ TEST(coroutine_socket, recv_success) {
 
     sleep(1);  // wait for the test server to start
 
-    coroutine::run([](void *arg) {
+    coroutine::run([port](void *arg) {
         Socket sock(SW_SOCK_TCP);
-        bool retval = sock.connect(TEST_HOST, TEST_PORT, -1);
+        bool retval = sock.connect(TEST_HOST, port, -1);
         ASSERT_EQ(retval, true);
         ASSERT_EQ(sock.errCode, 0);
         sock.send(SW_STRS("hello world\n"));
@@ -99,11 +121,12 @@ TEST(coroutine_socket, recv_success) {
 
 TEST(coroutine_socket, recv_fail) {
     pid_t pid;
+    int port = swoole::test::get_random_port();
 
-    Process proc([](Process *proc) {
+    Process proc([port](Process *proc) {
         on_receive_lambda_type receive_fn = [](ON_RECEIVE_PARAMS) { SERVER_THIS->close(req->info.fd, 0); };
 
-        Server serv(TEST_HOST, TEST_PORT, swoole::Server::MODE_BASE, SW_SOCK_TCP);
+        Server serv(TEST_HOST, port, swoole::Server::MODE_BASE, SW_SOCK_TCP);
         serv.on("onReceive", (void *) receive_fn);
         serv.start();
     });
@@ -112,9 +135,9 @@ TEST(coroutine_socket, recv_fail) {
 
     sleep(1);  // wait for the test server to start
 
-    coroutine::run([](void *arg) {
+    coroutine::run([port](void *arg) {
         Socket sock(SW_SOCK_TCP);
-        bool retval = sock.connect(TEST_HOST, TEST_PORT, -1);
+        bool retval = sock.connect(TEST_HOST, port, -1);
         ASSERT_EQ(retval, true);
         ASSERT_EQ(sock.errCode, 0);
         sock.send("close", 6);
@@ -667,7 +690,7 @@ TEST(coroutine_socket, event_hup) {
                         ASSERT_EQ(sock.errCode, 0);
 
                         auto buf = sock.get_read_buffer();
-                        swoole::Coroutine::create([&sock](void *args) {
+                        Coroutine::create([&sock](void *args) {
                             System::sleep(0.01);
                             sock.shutdown(SHUT_RDWR);
                         });
@@ -762,7 +785,7 @@ TEST(coroutine_socket, write_and_read) {
         std::string text = "Hello World";
         size_t length = text.length();
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             Socket sock(pairs[0], SW_SOCK_UNIX_STREAM);
             ssize_t result = sock.write(text.c_str(), length);
             sock.close();
@@ -787,7 +810,7 @@ TEST(coroutine_socket, write_and_read_2) {
         std::string text = "Hello World";
         size_t length = text.length();
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             Socket sock(pairs[0], AF_UNIX, SOCK_STREAM, 0);
             ssize_t result = sock.write(text.c_str(), length);
             sock.close();
@@ -812,7 +835,7 @@ TEST(coroutine_socket, writev_and_readv) {
         size_t length = text.length();
         socketpair(AF_UNIX, SOCK_STREAM, 0, pairs);
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             std::unique_ptr<iovec[]> iov(new iovec[iovcnt]);
             for (int i = 0; i < iovcnt; i++) {
                 iov[i].iov_base = (void *) text.c_str();
@@ -854,7 +877,7 @@ TEST(coroutine_socket, writevall_and_readvall) {
         size_t length = text.length();
         socketpair(AF_UNIX, SOCK_STREAM, 0, pairs);
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             std::unique_ptr<iovec[]> iov(new iovec[iovcnt]);
             for (int i = 0; i < iovcnt; i++) {
                 iov[i].iov_base = (void *) text.c_str();
@@ -892,7 +915,7 @@ TEST(coroutine_socket, sendfile) {
     coroutine::run([&](void *arg) {
         int pairs[2];
         socketpair(AF_UNIX, SOCK_STREAM, 0, pairs);
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             std::string file = get_jpg_file();
             Socket sock(pairs[0], SW_SOCK_UNIX_STREAM);
             bool result = sock.sendfile(file.c_str(), 0, 0);
@@ -918,24 +941,26 @@ void test_sendto_recvfrom(enum swSocketType sock_type) {
 
         const char *ip = sock_type == SW_SOCK_UDP ? "127.0.0.1" : "::1";
 
+        int port = swoole::test::get_random_port();
+
         Socket sock_server(sock_type);
         Socket sock_client(sock_type);
-        sock_server.bind(ip, 8080);
-        sock_client.bind(ip, 8081);
+        sock_server.bind(ip, port);
+        sock_client.bind(ip, port + 1);
 
         ON_SCOPE_EXIT {
             sock_server.close();
             sock_client.close();
         };
 
-        sock_server.sendto(ip, 8081, (const void *) server_text.c_str(), server_length);
+        sock_server.sendto(ip, port + 1, (const void *) server_text.c_str(), server_length);
 
         char data_from_server[128] = {};
         struct sockaddr_in serveraddr;
         bzero(&serveraddr, sizeof(serveraddr));
         serveraddr.sin_family = AF_INET;
         serveraddr.sin_addr.s_addr = inet_addr(ip);
-        serveraddr.sin_port = htons(8080);
+        serveraddr.sin_port = htons(port);
         socklen_t addr_length = sizeof(serveraddr);
 
         // receive data from server
@@ -947,7 +972,7 @@ void test_sendto_recvfrom(enum swSocketType sock_type) {
 
         // receive data from client
         char data_from_client[128] = {};
-        sock_client.sendto(ip, 8080, (const void *) client_text.c_str(), client_length);
+        sock_client.sendto(ip, port, (const void *) client_text.c_str(), client_length);
         result = sock_server.recvfrom(data_from_client, client_length);
         data_from_client[client_length] = '\0';
         ASSERT_EQ(result, client_length);
@@ -960,59 +985,64 @@ TEST(coroutine_socket, sendto_recvfrom_udp) {
     test_sendto_recvfrom(SW_SOCK_UDP6);
 }
 
-void socket_send(Socket &sock, int port) {
-    bool retval = sock.connect(host, port);
+void proxy_test(Socket &sock, bool https) {
+    if (https) {
+        sock.enable_ssl_encrypt();
+    }
+
+    bool retval = sock.connect(host, https ? 443 : 80);
     ON_SCOPE_EXIT {
         sock.close();
     };
     ASSERT_EQ(retval, true);
 
-    if (443 == port) {
+    if (https) {
         ASSERT_NE(sock.ssl_get_peer_cert(), "");
     }
 
-    sock.send("GET / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT "
-              "10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.106 Safari/537.36\r\n\r\n");
+    ASSERT_GT(sock.send(SW_STRL(TEST_REQUEST_BAIDU)), 0);
 
-    char buf[65536];
-    ssize_t result = 0;
-    ssize_t recv_total = 0;
+    String buf(65536);
     while (true) {
-        result = sock.recv(buf + recv_total, 65536 - recv_total);
-        if (0 == result) {
+        char rbuf[4096];
+        ssize_t nr = sock.recv(rbuf, sizeof(rbuf));
+        if (nr <= 0) {
             break;
         }
-        recv_total += result;
+        buf.append(rbuf, nr);
     }
-    std::string content(buf);
-    ASSERT_NE(content.find("baidu"), std::string::npos);
+    ASSERT_TRUE(buf.contains("www.baidu.com"));
 }
 
-TEST(coroutine_socket, socks5_proxy) {
+TEST(coroutine_socket, http_get_with_socks5_proxy) {
     coroutine::run([](void *arg) {
         Socket sock(SW_SOCK_TCP);
-        sock.socks5_proxy = new Socks5Proxy();
-        sock.socks5_proxy->host = std::string("127.0.0.1");
-        sock.socks5_proxy->port = 1080;
-        sock.socks5_proxy->dns_tunnel = 1;
-        sock.socks5_proxy->method = 0x02;
-        sock.socks5_proxy->username = std::string("user");
-        sock.socks5_proxy->password = std::string("password");
-
-        socket_send(sock, 80);
+        sock.socks5_proxy = create_socks5_proxy();
+        proxy_test(sock, false);
     });
 }
 
-TEST(coroutine_socket, http_proxy) {
+TEST(coroutine_socket, http_get_with_http_proxy) {
     coroutine::run([&](void *arg) {
         Socket sock(SW_SOCK_TCP);
-        sock.http_proxy = new HttpProxy();
-        sock.http_proxy->proxy_host = std::string("127.0.0.1");
-        sock.http_proxy->proxy_port = 8888;
-        sock.http_proxy->username = std::string("user");
-        sock.http_proxy->password = std::string("password");
+        sock.http_proxy = create_http_proxy();
+        proxy_test(sock, false);
+    });
+}
 
-        socket_send(sock, 80);
+TEST(coroutine_socket, https_get_with_socks5_proxy) {
+    coroutine::run([](void *arg) {
+        Socket sock(SW_SOCK_TCP);
+        sock.socks5_proxy = create_socks5_proxy();
+        proxy_test(sock, true);
+    });
+}
+
+TEST(coroutine_socket, https_get_with_http_proxy) {
+    coroutine::run([&](void *arg) {
+        Socket sock(SW_SOCK_TCP);
+        sock.http_proxy = create_http_proxy();
+        proxy_test(sock, true);
     });
 }
 
@@ -1028,7 +1058,7 @@ TEST(coroutine_socket, ssl) {
         sock.get_ssl_context()->allow_self_signed = true;
         sock.get_ssl_context()->cafile = swoole::test::get_root_path() + "/tests/include/ssl_certs/ca.crt";
 
-        socket_send(sock, 443);
+        proxy_test(sock, 443);
     });
 }
 #endif
@@ -1040,7 +1070,7 @@ TEST(coroutine_socket, peek) {
         std::string text = "Hello World";
         size_t length = text.length();
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             Socket sock(pairs[0], SW_SOCK_UNIX_STREAM);
             ssize_t result = sock.write(text.c_str(), length);
             sock.close();
@@ -1065,7 +1095,7 @@ TEST(coroutine_socket, sendmsg_and_recvmsg) {
         std::string text = "Hello World";
         size_t length = text.length();
 
-        swoole::Coroutine::create([&](void *) {
+        Coroutine::create([&](void *) {
             Socket sock(pairs[0], SW_SOCK_UNIX_STREAM);
             struct msghdr msg;
             struct iovec ivec;
@@ -1106,5 +1136,96 @@ TEST(coroutine_socket, sendmsg_and_recvmsg) {
         buf[ret] = '\0';
         sock.close();
         ASSERT_STREQ(buf, text.c_str());
+    });
+}
+
+std::pair<std::shared_ptr<Socket>, std::shared_ptr<Socket>> create_socket_pair() {
+    int pairs[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, pairs);
+
+    auto sock0 = new Socket(pairs[0], SW_SOCK_UNIX_STREAM);
+    auto sock1 = new Socket(pairs[1], SW_SOCK_UNIX_STREAM);
+
+    sock0->get_socket()->set_buffer_size(65536);
+    sock1->get_socket()->set_buffer_size(65536);
+
+    std::pair<std::shared_ptr<Socket>, std::shared_ptr<Socket>> result(sock0, sock1);
+    return result;
+}
+
+TEST(coroutine_socket, close) {
+    coroutine::run([&](void *arg) {
+        auto pair = create_socket_pair();
+
+        auto buffer = sw_tg_buffer();
+        buffer->clear();
+        buffer->append_random_bytes(256 * 1024, false);
+
+        std::map<std::string, bool> results;
+        auto _sock = pair.first;
+
+        // write co
+        Coroutine::create([&](void *) {
+            SW_LOOP_N(32) {
+                ssize_t result = _sock->write(buffer->value(), buffer->get_length());
+                if (result < 0 && _sock->errCode == ECANCELED) {
+                    ASSERT_FALSE(_sock->close());
+                    ASSERT_EQ(_sock->errCode, SW_ERROR_CO_SOCKET_CLOSE_WAIT);
+                    results["write"] = true;
+                    ASSERT_EQ(_sock->write(buffer->value(), buffer->get_length()), -1);
+                    ASSERT_EQ(_sock->errCode, EBADF);
+                    break;
+                }
+            }
+        });
+
+        // read co
+        Coroutine::create([&](void *) {
+            SW_LOOP_N(32) {
+                char buf[4096];
+                ssize_t result = _sock->read(buf, sizeof(buf));
+                if (result < 0 && _sock->errCode == ECANCELED) {
+                    ASSERT_TRUE(_sock->close());
+                    results["read"] = true;
+                    break;
+                }
+            }
+        });
+
+        System::sleep(0.1);
+        ASSERT_FALSE(_sock->close());
+        ASSERT_EQ(_sock->errCode, SW_ERROR_CO_SOCKET_CLOSE_WAIT);
+        ASSERT_TRUE(_sock->is_closed());
+        ASSERT_TRUE(results["write"]);
+        ASSERT_TRUE(results["read"]);
+        ASSERT_FALSE(_sock->close());
+        ASSERT_EQ(_sock->errCode, EBADF);
+    });
+}
+
+TEST(coroutine_socket, cancel) {
+    coroutine::run([&](void *arg) {
+        auto pair = create_socket_pair();
+
+        auto buffer = sw_tg_buffer();
+        buffer->clear();
+        buffer->append_random_bytes(256 * 1024, false);
+
+        std::map<std::string, bool> results;
+        // read co
+        Coroutine::create([&](void *) {
+            SW_LOOP_N(32) {
+                char buf[4096];
+                ssize_t result = pair.first->read(buf, sizeof(buf));
+                if (result < 0 && pair.first->errCode == ECANCELED) {
+                    results["read"] = true;
+                    break;
+                }
+            }
+        });
+
+        System::sleep(0.1);
+        pair.first->cancel(SW_EVENT_READ);
+        ASSERT_TRUE(results["read"]);
     });
 }

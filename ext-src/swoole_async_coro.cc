@@ -33,7 +33,7 @@ struct DNSCacheEntity {
     time_t update_time;
 };
 
-static std::unordered_map<std::string, DNSCacheEntity *> request_cache_map;
+static SW_THREAD_LOCAL std::unordered_map<std::string, DNSCacheEntity *> request_cache_map;
 
 void php_swoole_async_coro_rshutdown() {
     for (auto i = request_cache_map.begin(); i != request_cache_map.end(); i++) {
@@ -44,27 +44,42 @@ void php_swoole_async_coro_rshutdown() {
 void php_swoole_set_aio_option(HashTable *vht) {
     zval *ztmp;
     /* AIO */
-   if (php_swoole_array_get_value(vht, "aio_core_worker_num", ztmp)) {
-       zend_long v = zval_get_long(ztmp);
-       v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
-       SwooleG.aio_core_worker_num = v;
-   }
-   if (php_swoole_array_get_value(vht, "aio_worker_num", ztmp)) {
-       zend_long v = zval_get_long(ztmp);
-       v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
-       SwooleG.aio_worker_num = v;
-   }
-   if (php_swoole_array_get_value(vht, "aio_max_wait_time", ztmp)) {
-       SwooleG.aio_max_wait_time = zval_get_double(ztmp);
-   }
-   if (php_swoole_array_get_value(vht, "aio_max_idle_time", ztmp)) {
-       SwooleG.aio_max_idle_time = zval_get_double(ztmp);
-   }
+    if (php_swoole_array_get_value(vht, "aio_core_worker_num", ztmp)) {
+        zend_long v = zval_get_long(ztmp);
+        v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
+        SwooleG.aio_core_worker_num = v;
+    }
+    if (php_swoole_array_get_value(vht, "aio_worker_num", ztmp)) {
+        zend_long v = zval_get_long(ztmp);
+        v = SW_MAX(1, SW_MIN(v, UINT32_MAX));
+        SwooleG.aio_worker_num = v;
+    }
+    if (php_swoole_array_get_value(vht, "aio_max_wait_time", ztmp)) {
+        SwooleG.aio_max_wait_time = zval_get_double(ztmp);
+    }
+    if (php_swoole_array_get_value(vht, "aio_max_idle_time", ztmp)) {
+        SwooleG.aio_max_idle_time = zval_get_double(ztmp);
+    }
+#ifdef SW_USE_IOURING
+    if (php_swoole_array_get_value(vht, "iouring_entries", ztmp)) {
+        zend_long v = zval_get_long(ztmp);
+        SwooleG.iouring_entries = SW_MAX(0, SW_MIN(v, UINT32_MAX));
+    }
+    if (php_swoole_array_get_value(vht, "iouring_workers", ztmp)) {
+        zend_long v = zval_get_long(ztmp);
+        SwooleG.iouring_workers = SW_MAX(0, SW_MIN(v, UINT32_MAX));
+    }
+    if (php_swoole_array_get_value(vht, "iouring_flag", ztmp)) {
+        SwooleG.iouring_flag = zval_get_long(ztmp);
+    }
+#endif
 }
 
 PHP_FUNCTION(swoole_async_set) {
+    SW_MUST_BE_MAIN_THREAD();
     if (sw_reactor()) {
         php_swoole_fatal_error(E_ERROR, "eventLoop has already been created. unable to change settings");
+        swoole_set_last_error(SW_ERROR_OPERATION_NOT_SUPPORT);
         RETURN_FALSE;
     }
 
@@ -111,19 +126,24 @@ PHP_FUNCTION(swoole_async_set) {
         SwooleG.use_async_resolver = zval_is_true(ztmp);
     }
     if (php_swoole_array_get_value(vht, "enable_coroutine", ztmp)) {
-        SWOOLE_G(enable_coroutine) = zval_is_true(ztmp);
+        SwooleG.enable_coroutine = zval_is_true(ztmp);
     }
+    RETURN_TRUE;
 }
 
 PHP_FUNCTION(swoole_async_dns_lookup_coro) {
     Coroutine::get_current_safe();
 
     zval *domain;
-    long type = AF_INET;
+    zend_long type = AF_INET;
     double timeout = swoole::network::Socket::default_dns_timeout;
-    if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|dl", &domain, &timeout, &type) == FAILURE) {
-        RETURN_FALSE;
-    }
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+    Z_PARAM_ZVAL(domain)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_DOUBLE(timeout)
+    Z_PARAM_LONG(type)
+    ZEND_PARSE_PARAMETERS_END_EX(RETURN_FALSE);
 
     if (Z_TYPE_P(domain) != IS_STRING) {
         php_swoole_fatal_error(E_WARNING, "invalid domain name");
@@ -169,5 +189,5 @@ PHP_FUNCTION(swoole_async_dns_lookup_coro) {
     }
     memcpy(cache->address, Z_STRVAL_P(return_value), Z_STRLEN_P(return_value));
     cache->address[Z_STRLEN_P(return_value)] = '\0';
-    cache->update_time = Timer::get_absolute_msec() + (int64_t)(SwooleG.dns_cache_refresh_time * 1000);
+    cache->update_time = Timer::get_absolute_msec() + (int64_t) (SwooleG.dns_cache_refresh_time * 1000);
 }

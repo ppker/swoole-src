@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -50,8 +50,8 @@ TEST(redis, server) {
 
     serv.create();
 
-    serv.onWorkerStart = [&](swServer *serv, int worker_id) {
-        if (worker_id != 0) {
+    serv.onWorkerStart = [&](Server *serv, Worker *worker) {
+        if (worker->id != 0) {
             return;
         }
         swoole::Coroutine::create(
@@ -66,7 +66,7 @@ TEST(redis, server) {
             serv);
     };
 
-    serv.onReceive = [](swServer *serv, swRecvData *req) -> int {
+    serv.onReceive = [](Server *serv, RecvData *req) -> int {
         int session_id = req->info.fd;
         auto list = redis::parse(req->data, req->info.len);
 

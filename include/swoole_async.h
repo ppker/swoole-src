@@ -12,7 +12,7 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
@@ -20,8 +20,6 @@
 
 #include <vector>
 #include <string>
-#include <mutex>
-#include <atomic>
 
 #ifndef O_DIRECT
 #define O_DIRECT 040000
@@ -34,24 +32,22 @@ enum AsyncFlag {
     SW_AIO_EOF = 1u << 2,
 };
 
+struct AsyncRequest {
+    virtual ~AsyncRequest() = default;
+};
+
 struct AsyncEvent {
-    int fd;
     size_t task_id;
-    uint8_t lock;
     uint8_t canceled;
+    int error;
     /**
      * input & output
      */
-    uint16_t flags;
-    off_t offset;
-    size_t nbytes;
-    void *buf;
-    void *req;
+    std::shared_ptr<AsyncRequest> data;
     /**
      * output
      */
     ssize_t retval;
-    int error;
     /**
      * internal use only
      */
@@ -66,12 +62,52 @@ struct AsyncEvent {
     }
 };
 
+struct GethostbynameRequest : public AsyncRequest {
+    std::string name;
+    int family;
+    char *addr;
+    size_t addr_len;
+
+    GethostbynameRequest(std::string _name, int _family) : name(std::move(_name)), family(_family) {
+        addr_len = _family == AF_INET6 ? INET6_ADDRSTRLEN : INET_ADDRSTRLEN;
+        addr = new char[addr_len];
+    }
+
+    ~GethostbynameRequest() override {
+        delete[] addr;
+    }
+};
+
+struct GetaddrinfoRequest : public AsyncRequest {
+    std::string hostname;
+    std::string service;
+    int family;
+    int socktype;
+    int protocol;
+    int error;
+    std::vector<struct sockaddr_in6> results;
+    int count;
+
+    void parse_result(std::vector<std::string> &retval);
+
+    GetaddrinfoRequest(std::string _hostname, int _family, int _socktype, int _protocol, std::string _service)
+        : hostname(std::move(_hostname)),
+          service(std::move(_service)) {
+        family =_family;
+        socktype =_socktype;
+        protocol =_protocol;
+        count = 0;
+        error = 0;
+    }
+
+    ~GetaddrinfoRequest() override = default;
+};
+
 class AsyncThreads {
   public:
-    bool schedule = false;
     size_t task_num = 0;
     Pipe *pipe = nullptr;
-    async::ThreadPool *pool = nullptr;
+    std::shared_ptr<async::ThreadPool> pool;
     network::Socket *read_socket = nullptr;
     network::Socket *write_socket = nullptr;
 
@@ -87,8 +123,6 @@ class AsyncThreads {
     void notify_one();
 
     static int callback(Reactor *reactor, Event *event);
-  private:
-    std::mutex init_lock;
 };
 
 namespace async {

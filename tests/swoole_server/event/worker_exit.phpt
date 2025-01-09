@@ -29,7 +29,7 @@ $pm->parentFunc = function () use ($pm) {
 };
 
 $pm->childFunc = function () use ($pm, $atomic) {
-    $serv = new Server('127.0.0.1', $pm->getFreePort());
+    $serv = new Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
 
     $serv->set([
         'worker_num' => 1,
@@ -55,7 +55,7 @@ $pm->childFunc = function () use ($pm, $atomic) {
             usleep(10000);
             $serv->shutdown();
         } else {
-            $serv->timer = Timer::tick(100, function () use ($serv, $pm) {
+            $GLOBALS['timer'] = Timer::tick(100, function () use ($serv, $pm) {
                 $pm->writeLog(
                     'tick, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus());
                 $pm->wakeup();
@@ -66,14 +66,15 @@ $pm->childFunc = function () use ($pm, $atomic) {
     $serv->on(Constant::EVENT_WORKER_EXIT, function (Server $serv) use ($atomic, $pm) {
         $pm->writeLog(
             'worker exit, id=' . $serv->getWorkerId() . ', status=' . $serv->getWorkerStatus());
-        Timer::clear($serv->timer);
+        Timer::clear($GLOBALS['timer']);
     });
 
     $serv->on(Constant::EVENT_WORKER_STOP, function (Server $serv) use ($pm) {
         $pm->writeLog('worker stop');
     });
 
-    $serv->on("Receive", function () { });
+    $serv->on("Receive", function () {
+    });
 
     $serv->start();
 };

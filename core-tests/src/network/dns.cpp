@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -74,14 +74,7 @@ TEST(dns, cancel) {
 }
 
 TEST(dns, getaddrinfo) {
-    char buf[1024] = {};
-    swoole::network::GetaddrinfoRequest req = {};
-    req.hostname = "www.baidu.com";
-    req.family = AF_INET;
-    req.socktype = SOCK_STREAM;
-    req.protocol = 0;
-    req.service = nullptr;
-    req.result = buf;
+    swoole::GetaddrinfoRequest req("www.baidu.com", AF_INET, SOCK_STREAM, 0, "");
     ASSERT_EQ(swoole::network::getaddrinfo(&req), 0);
     ASSERT_GT(req.count, 0);
 
@@ -97,17 +90,18 @@ TEST(dns, load_resolv_conf) {
     // reset
     SwooleG.dns_server_host = "";
     SwooleG.dns_server_port = 0;
+    int port = swoole::test::get_random_port();
 
     auto dns_server = swoole_get_dns_server();
     ASSERT_TRUE(dns_server.first.empty());
     ASSERT_EQ(dns_server.second, 0);
 
     // with port
-    std::string test_server = "127.0.0.1:8080";  // fake dns server
+    std::string test_server = "127.0.0.1:" + std::to_string(port);  // fake dns server
     swoole_set_dns_server(test_server);
     dns_server = swoole_get_dns_server();
     ASSERT_STREQ(dns_server.first.c_str(), "127.0.0.1");
-    ASSERT_EQ(dns_server.second, 8080);
+    ASSERT_EQ(dns_server.second, port);
 
     // invalid port
     test_server = "127.0.0.1:808088";
