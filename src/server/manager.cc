@@ -40,8 +40,9 @@ struct Manager {
 
     std::vector<pid_t> kill_workers;
 
-    void start(Server *_server);
+    void wait(Server *_server);
     void add_timeout_killer(Worker *workers, int n);
+    void terminate_all_worker();
 
     static void signal_handler(int sig);
     static void timer_callback(Timer *timer, TimerNode *tnode);
@@ -96,126 +97,73 @@ void Manager::add_timeout_killer(Worker *workers, int n) {
     swoole_timer_after((long) (server_->max_wait_time * 2 * 1000), kill_timeout_process, _list);
 }
 
-// create worker child proccess
 int Server::start_manager_process() {
-    pid_t pid;
-
-    if (task_worker_num > 0) {
-        if (create_task_workers() < 0) {
-            return SW_ERR;
-        }
-
-        Worker *worker;
-        SW_LOOP_N(task_worker_num) {
-            worker = &gs->task_workers.workers[i];
-            create_worker(worker);
-            if (task_ipc_mode == TASK_IPC_UNIXSOCK) {
-                store_pipe_fd(worker->pipe_object);
-            }
-        }
+    SW_LOOP_N(worker_num) {
+        create_worker(get_worker(i));
     }
 
-    // User Worker Process
-    if (get_user_worker_num() > 0) {
-        if (create_user_workers() < 0) {
-            return SW_ERR;
-        }
-
-        int i = 0;
-        for (auto worker : user_worker_list) {
-            memcpy(&user_workers[i], worker, sizeof(user_workers[i]));
-            create_worker(worker);
-            i++;
-        }
-    }
-
-    if (gs->event_workers.create_message_box(65536) == SW_ERR) {
+    if (gs->event_workers.create_message_box(SW_MESSAGE_BOX_SIZE) == SW_ERR) {
         return SW_ERR;
     }
 
-    pid = swoole_fork(0);
-    switch (pid) {
-    // fork manager process
-    case 0: {
-        // wait master process
-        if (!is_started()) {
-            swoole_error("master process is not running");
-            return SW_ERR;
-        }
+    if (task_worker_num > 0 && create_task_workers() < 0) {
+        return SW_ERR;
+    }
 
-        pid_t pid;
+    if (get_user_worker_num() > 0 && create_user_workers() < 0) {
+        return SW_ERR;
+    }
+
+    auto fn = [this](void) {
+        swoole_set_process_type(SW_PROCESS_MANAGER);
+        gs->manager_pid = SwooleG.pid = getpid();
 
         if (task_worker_num > 0) {
             if (gs->task_workers.start() == SW_ERR) {
-                swoole_error("failed to start task workers");
-                return SW_ERR;
+                swoole_sys_error("failed to start task worker");
+                return;
             }
         }
 
         SW_LOOP_N(worker_num) {
             Worker *worker = get_worker(i);
-            pid = spawn_event_worker(worker);
-            if (pid < 0) {
-                swoole_error("fork() failed");
-                return SW_ERR;
-            } else {
-                worker->pid = pid;
+            if (factory->spawn_event_worker(worker) < 0) {
+                swoole_sys_error("failed to fork event worker");
+                return;
             }
         }
 
         if (!user_worker_list.empty()) {
             for (auto worker : user_worker_list) {
-                if (worker->pipe_object) {
-                    store_pipe_fd(worker->pipe_object);
-                }
-                pid = spawn_user_worker(worker);
-                if (pid < 0) {
-                    swoole_error("failed to start user workers");
-                    return SW_ERR;
+                if (factory->spawn_user_worker(worker) < 0) {
+                    swoole_sys_error("failed to fork user worker");
+                    return;
                 }
             }
         }
 
-        SwooleG.process_type = SW_PROCESS_MANAGER;
-        SwooleG.pid = getpid();
         Manager manager{};
-        manager.start(this);
-        exit(0);
-        break;
-    }
-    // master process
-    default:
-        gs->event_workers.master_pid = gs->manager_pid = pid;
-        break;
-    case -1:
-        swoole_error("fork() failed");
-        return SW_ERR;
+        manager.wait(this);
+    };
+
+    if (is_base_mode()) {
+        fn();
+    } else {
+        if (swoole_fork_exec(fn) < 0) {
+            swoole_sys_warning("failed fork manager process");
+            return SW_ERR;
+        }
     }
     return SW_OK;
 }
 
-void Server::check_worker_exit_status(int worker_id, const ExitStatus &exit_status) {
-    if (exit_status.get_status() != 0) {
-        swoole_warning("worker(pid=%d, id=%d) abnormal exit, status=%d, signal=%d"
-                       "%s",
-                       exit_status.get_pid(),
-                       worker_id,
-                       exit_status.get_code(),
-                       exit_status.get_signal(),
-                       exit_status.get_signal() == SIGSEGV ? SwooleG.bug_report_message.c_str() : "");
-
-        if (onWorkerError != nullptr) {
-            onWorkerError(this, worker_id, exit_status);
-        }
-    }
-}
-
-void Manager::start(Server *_server) {
+void Manager::wait(Server *_server) {
     server_ = _server;
     server_->manager = this;
 
     ProcessPool *pool = &server_->gs->event_workers;
     pool->onWorkerMessage = Server::read_worker_message;
+    _server->gs->manager_pid = _server->gs->event_workers.master_pid = getpid();
 
     SwooleTG.reactor = nullptr;
 
@@ -237,19 +185,16 @@ void Manager::start(Server *_server) {
 #ifdef SIGRTMIN
     swoole_signal_set(SIGRTMIN, signal_handler);
 #endif
-    // swSignal_set(SIGINT, signal_handler);
-#if defined(__linux__)
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-#elif defined(__FreeBSD__)
-    int sigid = SIGTERM;
-    procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sigid);
-#endif
 
-#ifdef HAVE_PTHREAD_BARRIER
-    pthread_barrier_wait(&_server->gs->manager_barrier);
-#else
-    SW_START_SLEEP;
+    if (_server->is_process_mode()) {
+#if defined(__linux__)
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+#elif defined(__FreeBSD__)
+        int sigid = SIGTERM;
+        procctl(P_PID, 0, PROC_PDEATHSIG_CTL, &sigid);
 #endif
+        _server->gs->manager_barrier.wait();
+    }
 
     if (_server->isset_hook(Server::HOOK_MANAGER_START)) {
         _server->call_hook(Server::HOOK_MANAGER_START, _server);
@@ -265,7 +210,7 @@ void Manager::start(Server *_server) {
 
     while (_server->running) {
         ExitStatus exit_status = wait_process();
-
+        const auto errnoAfterWait = errno;
         if (pool->read_message) {
             EventData msg;
             while (pool->pop_message(&msg, sizeof(msg)) > 0) {
@@ -279,27 +224,23 @@ void Manager::start(Server *_server) {
                 WorkerStopMessage worker_stop_msg;
                 memcpy(&worker_stop_msg, msg.data, sizeof(worker_stop_msg));
                 if (worker_stop_msg.worker_id >= _server->worker_num) {
-                    _server->spawn_task_worker(_server->get_worker(worker_stop_msg.worker_id));
+                    _server->factory->spawn_task_worker(_server->get_worker(worker_stop_msg.worker_id));
                 } else {
                     Worker *worker = _server->get_worker(worker_stop_msg.worker_id);
-                    pid_t new_pid = _server->spawn_event_worker(worker);
-                    if (new_pid > 0) {
-                        worker->pid = new_pid;
-                    }
+                    _server->factory->spawn_event_worker(worker);
                 }
             }
             pool->read_message = false;
         }
 
-        if (SwooleG.signal_alarm && SwooleTG.timer) {
-            SwooleG.signal_alarm = 0;
-            swoole_timer_select();
+        if (SwooleTG.timer) {
+            SwooleTG.timer->select();
         }
 
         if (exit_status.get_pid() < 0) {
             if (!pool->reloading) {
             _error:
-                if (errno > 0 && errno != EINTR) {
+                if (errnoAfterWait > 0 && errnoAfterWait != EINTR) {
                     swoole_sys_warning("wait() failed");
                 }
                 continue;
@@ -330,7 +271,8 @@ void Manager::start(Server *_server) {
                     if (_server->reload_async) {
                         SW_LOOP_N(_server->worker_num) {
                             if (swoole_kill(pool->reload_workers[i].pid, SIGTERM) < 0) {
-                                swoole_sys_warning("swKill(%d, SIGTERM) [%d] failed", pool->reload_workers[i].pid, i);
+                                swoole_sys_warning(
+                                    "failed to kill(%d, SIGTERM) worker#[%d]", pool->reload_workers[i].pid, i);
                             }
                         }
                         pool->reload_worker_i = _server->worker_num;
@@ -369,33 +311,29 @@ void Manager::start(Server *_server) {
         if (_server->running) {
             // event workers
             SW_LOOP_N(_server->worker_num) {
+                Worker *worker = _server->get_worker(i);
                 // find worker
-                if (exit_status.get_pid() != _server->workers[i].pid) {
+                if (exit_status.get_pid() != worker->pid) {
                     continue;
                 }
 
                 // check the process return code and signal
-                _server->check_worker_exit_status(i, exit_status);
+                _server->factory->check_worker_exit_status(worker, exit_status);
 
-                while (1) {
-                    Worker *worker = _server->get_worker(i);
-                    pid_t new_pid = _server->spawn_event_worker(worker);
-                    if (new_pid < 0) {
+                do {
+                    if (_server->factory->spawn_event_worker(worker) < 0) {
                         SW_START_SLEEP;
                         continue;
-                    } else {
-                        worker->pid = new_pid;
-                        break;
                     }
-                }
+                } while (0);
             }
 
             // task worker
             if (_server->gs->task_workers.map_) {
                 auto iter = _server->gs->task_workers.map_->find(exit_status.get_pid());
                 if (iter != _server->gs->task_workers.map_->end()) {
-                    _server->check_worker_exit_status(iter->second->id, exit_status);
-                    _server->spawn_task_worker(iter->second);
+                    _server->factory->check_worker_exit_status(iter->second, exit_status);
+                    _server->factory->spawn_task_worker(iter->second);
                 }
             }
             // user process
@@ -446,7 +384,7 @@ void Manager::start(Server *_server) {
             }
         }
         if (!_server->user_worker_map.empty()) {
-            for (auto kv : _server->user_worker_map) {
+            for (auto &kv : _server->user_worker_map) {
                 kill_workers.push_back(kv.second->pid);
             }
         }
@@ -455,9 +393,9 @@ void Manager::start(Server *_server) {
          */
         alarm(_server->max_wait_time * 2);
     }
-    _server->kill_event_workers();
-    _server->kill_task_workers();
-    _server->kill_user_workers();
+    _server->factory->kill_event_workers();
+    _server->factory->kill_task_workers();
+    _server->factory->kill_user_workers();
     // force kill
     if (_server->max_wait_time) {
         alarm(0);
@@ -467,7 +405,15 @@ void Manager::start(Server *_server) {
     }
 }
 
-void Manager::signal_handler(int sig) {
+void Manager::terminate_all_worker() {
+    // clear the timer
+    alarm(0);
+    for (auto i = kill_workers.begin(); i != kill_workers.end(); i++) {
+        swoole_kill(*i, SIGKILL);
+    }
+}
+
+void Manager::signal_handler(int signo) {
     Server *_server = sw_server();
     if (!_server || !_server->manager) {
         return;
@@ -475,43 +421,26 @@ void Manager::signal_handler(int sig) {
     Manager *manager = _server->manager;
     ProcessPool *pool = &_server->gs->event_workers;
 
-    switch (sig) {
+    switch (signo) {
     case SIGTERM:
         _server->running = false;
         break;
-        /**
-         * reload all workers
-         */
     case SIGUSR1:
-        if (pool->reload()) {
-            manager->reload_all_worker = true;
-        }
-        sw_logger()->reopen();
-        break;
-        /**
-         * only reload task workers
-         */
     case SIGUSR2:
-        if (pool->reload()) {
-            manager->reload_task_worker = true;
-        }
+        _server->reload(signo == SIGUSR1);
         sw_logger()->reopen();
         break;
     case SIGIO:
         pool->read_message = true;
         break;
     case SIGALRM:
-        SwooleG.signal_alarm = 1;
         if (manager->force_kill) {
-            alarm(0);
-            for (auto i = manager->kill_workers.begin(); i != manager->kill_workers.end(); i++) {
-                kill(*i, SIGKILL);
-            }
+            manager->terminate_all_worker();
         }
         break;
     default:
 #ifdef SIGRTMIN
-        if (sig == SIGRTMIN) {
+        if (signo == SIGRTMIN) {
             sw_logger()->reopen();
         }
 #endif
@@ -547,16 +476,16 @@ int Server::wait_other_worker(ProcessPool *pool, const ExitStatus &exit_status) 
         return SW_ERR;
     } while (0);
 
-    serv->check_worker_exit_status(exit_worker->id, exit_status);
+    serv->factory->check_worker_exit_status(exit_worker, exit_status);
 
     pid_t new_process_pid = -1;
 
     switch (worker_type) {
     case SW_PROCESS_TASKWORKER:
-        new_process_pid = serv->spawn_task_worker(exit_worker);
+        new_process_pid = serv->factory->spawn_task_worker(exit_worker);
         break;
     case SW_PROCESS_USERWORKER:
-        new_process_pid = serv->spawn_user_worker(exit_worker);
+        new_process_pid = serv->factory->spawn_user_worker(exit_worker);
         break;
     default:
         /* never here */
@@ -597,110 +526,31 @@ void Server::read_worker_message(ProcessPool *pool, EventData *msg) {
     serv->message_bus.write(serv->get_command_reply_socket(), &task);
 }
 
-/**
- * kill and wait all user process
- */
-void Server::kill_user_workers() {
-    if (user_worker_map.empty()) {
-        return;
+bool Server::reload(bool reload_all_workers) {
+    if (is_thread_mode()) {
+        return reload_worker_threads(reload_all_workers);
     }
 
-    for (auto &kv : user_worker_map) {
-        swoole_kill(kv.second->pid, SIGTERM);
+    if (gs->manager_pid == 0) {
+        swoole_error_log(SW_LOG_WARNING, SW_ERROR_OPERATION_NOT_SUPPORT, "not supported with single process mode");
+        return false;
     }
 
-    for (auto &kv : user_worker_map) {
-        int __stat_loc;
-        if (swoole_waitpid(kv.second->pid, &__stat_loc, 0) < 0) {
-            swoole_sys_warning("waitpid(%d) failed", kv.second->pid);
-        }
-    }
-}
-
-/**
- * kill and wait all child process
- */
-void Server::kill_event_workers() {
-    int status;
-
-    if (worker_num == 0) {
-        return;
+    if (getpid() != gs->manager_pid) {
+        return swoole_kill(get_manager_pid(), reload_all_workers ? SIGUSR1 : SIGUSR2) == 0;
     }
 
-    SW_LOOP_N(worker_num) {
-        swoole_trace("[Manager]kill worker processor");
-        swoole_kill(workers[i].pid, SIGTERM);
+    ProcessPool *pool = &gs->event_workers;
+    if (!pool->reload()) {
+        return false;
     }
-    SW_LOOP_N(worker_num) {
-        if (swoole_waitpid(workers[i].pid, &status, 0) < 0) {
-            swoole_sys_warning("waitpid(%d) failed", workers[i].pid);
-        }
-    }
-}
 
-/**
- * kill and wait task process
- */
-void Server::kill_task_workers() {
-    if (task_worker_num == 0) {
-        return;
+    if (reload_all_workers) {
+        manager->reload_all_worker = true;
+    } else {
+        manager->reload_task_worker = true;
     }
-    gs->task_workers.shutdown();
-}
-
-pid_t Server::spawn_event_worker(Worker *worker) {
-    pid_t pid;
-
-    pid = swoole_fork(0);
-
-    // fork() failed
-    if (pid < 0) {
-        swoole_sys_warning("Fork Worker failed");
-        return SW_ERR;
-    }
-    // worker child processor
-    else if (pid == 0) {
-        exit(start_event_worker(worker));
-    }
-    // parent,add to writer
-    else {
-        return pid;
-    }
-}
-
-pid_t Server::spawn_user_worker(Worker *worker) {
-    pid_t pid = swoole_fork(0);
-
-    if (pid < 0) {
-        swoole_sys_warning("Fork Worker failed");
-        return SW_ERR;
-    }
-    // child
-    else if (pid == 0) {
-        SwooleG.process_type = SW_PROCESS_USERWORKER;
-        SwooleG.process_id = worker->id;
-        SwooleWG.worker = worker;
-        worker->pid = getpid();
-        onUserWorkerStart(this, worker);
-        exit(0);
-    }
-    // parent
-    else {
-        if (worker->pid) {
-            user_worker_map.erase(worker->pid);
-        }
-        /**
-         * worker: local memory
-         * user_workers: shared memory
-         */
-        get_worker(worker->id)->pid = worker->pid = pid;
-        user_worker_map.emplace(std::make_pair(pid, worker));
-        return pid;
-    }
-}
-
-pid_t Server::spawn_task_worker(Worker *worker) {
-    return gs->task_workers.spawn(worker);
+    return true;
 }
 
 }  // namespace swoole

@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -112,6 +112,31 @@ bool Socket::add_event(const EventType event) {
     return ret;
 }
 
+#ifdef SW_LOG_TRACE_OPEN
+static const char *get_trigger_event_name(Socket *socket, EventType added_event) {
+    if (socket->is_closed()) {
+        return "CLOSE";
+    }
+    if (socket->errCode) {
+        return socket->errCode == ETIMEDOUT ? "TIMEOUT" : "ERROR";
+    }
+    return added_event == SW_EVENT_READ ? "READ" : "WRITE";
+}
+
+static const char *get_wait_event_name(Socket *socket, EventType event) {
+#ifdef SW_USE_OPENSSL
+    if (socket->get_socket()->ssl_want_read) {
+        return "SSL READ";
+    } else if (socket->get_socket()->ssl_want_write) {
+        return "SSL WRITE";
+    } else
+#endif
+    {
+        return event == SW_EVENT_READ ? "READ" : "WRITE";
+    }
+}
+#endif
+
 /**
  * If an exception occurs while waiting for an event, false is returned.
  * For example, when waiting for a read event, timeout, connection closed, are exceptions to the interrupt event.
@@ -123,6 +148,10 @@ bool Socket::wait_event(const EventType event, const void **__buf, size_t __n) {
     EventType added_event = event;
     Coroutine *co = Coroutine::get_current_safe();
     if (!co) {
+        return false;
+    }
+    if (sw_unlikely(socket->close_wait)) {
+        set_err(SW_ERROR_CO_SOCKET_CLOSE_WAIT);
         return false;
     }
 
@@ -148,11 +177,7 @@ bool Socket::wait_event(const EventType event, const void **__buf, size_t __n) {
                      "socket#%d blongs to cid#%ld is waiting for %s event",
                      sock_fd,
                      co->get_cid(),
-#ifdef SW_USE_OPENSSL
-                     socket->ssl_want_read ? "SSL READ"
-                                           : socket->ssl_want_write ? "SSL WRITE" :
-#endif
-                                                                    event == SW_EVENT_READ ? "READ" : "WRITE");
+                     get_wait_event_name(this, event));
 
     Coroutine::CancelFunc cancel_fn = [this, event](Coroutine *co) { return cancel(event); };
 
@@ -196,10 +221,8 @@ _failed:
                      "socket#%d blongs to cid#%ld trigger %s event",
                      sock_fd,
                      co->get_cid(),
-                     closed ? "CLOSE"
-                            : errCode ? errCode == ETIMEDOUT ? "TIMEOUT" : "ERROR"
-                                      : added_event == SW_EVENT_READ ? "READ" : "WRITE");
-    return !closed && !errCode;
+                     get_trigger_event_name(this, added_event));
+    return !is_closed() && !errCode;
 }
 
 bool Socket::socks5_handshake() {
@@ -328,20 +351,10 @@ bool Socket::socks5_handshake() {
 }
 
 bool Socket::http_proxy_handshake() {
-#define HTTP_PROXY_FMT                                                                                                 \
-    "CONNECT %.*s:%d HTTP/1.1\r\n"                                                                                     \
-    "Host: %.*s:%d\r\n"                                                                                                \
-    "User-Agent: Swoole/" SWOOLE_VERSION "\r\n"                                                                        \
-    "Proxy-Connection: Keep-Alive\r\n"
-
-    // CONNECT
-    int n;
-    const char *host = http_proxy->target_host.c_str();
-    int host_len = http_proxy->target_host.length();
+    const std::string *real_host = &http_proxy->target_host;
 #ifdef SW_USE_OPENSSL
     if (ssl_context && !ssl_context->tls_host_name.empty()) {
-        host = ssl_context->tls_host_name.c_str();
-        host_len = ssl_context->tls_host_name.length();
+        real_host = &ssl_context->tls_host_name;
     }
 #endif
 
@@ -350,34 +363,11 @@ bool Socket::http_proxy_handshake() {
         send_buffer->clear();
     };
 
-    if (!http_proxy->password.empty()) {
-        auto auth_str = http_proxy->get_auth_str();
-        n = sw_snprintf(send_buffer->str,
-                        send_buffer->size,
-                        HTTP_PROXY_FMT "Proxy-Authorization: Basic %s\r\n\r\n",
-                        (int) http_proxy->target_host.length(),
-                        http_proxy->target_host.c_str(),
-                        http_proxy->target_port,
-                        host_len,
-                        host,
-                        http_proxy->target_port,
-                        auth_str.c_str());
-    } else {
-        n = sw_snprintf(send_buffer->str,
-                        send_buffer->size,
-                        HTTP_PROXY_FMT "\r\n",
-                        (int) http_proxy->target_host.length(),
-                        http_proxy->target_host.c_str(),
-                        http_proxy->target_port,
-                        host_len,
-                        host,
-                        http_proxy->target_port);
-    }
-
-    swoole_trace_log(SW_TRACE_HTTP_CLIENT, "proxy request: <<EOF\n%.*sEOF", n, send_buffer->str);
-
+    size_t n = http_proxy->pack(send_buffer, real_host);
     send_buffer->length = n;
-    if (send(send_buffer->str, n) != n) {
+    swoole_trace_log(SW_TRACE_HTTP_CLIENT, "proxy request: <<EOF\n%.*sEOF", (int) n, send_buffer->str);
+
+    if (send(send_buffer->str, n) != (ssize_t) n) {
         return false;
     }
 
@@ -392,70 +382,30 @@ bool Socket::http_proxy_handshake() {
     protocol.package_eof_len = sizeof("\r\n\r\n") - 1;
     memcpy(protocol.package_eof, SW_STRS("\r\n\r\n"));
 
-    n = recv_packet();
-    if (n <= 0) {
+    if (recv_packet() <= 0) {
         return false;
     }
 
     swoole_trace_log(SW_TRACE_HTTP_CLIENT, "proxy response: <<EOF\n%.*sEOF", n, recv_buffer->str);
 
-    bool ret = false;
-    char *buf = recv_buffer->str;
-    int len = n;
-    int state = 0;
-    char *p = buf;
-    char *pe = buf + len;
-    for (; p < buf + len; p++) {
-        if (state == 0) {
-            if (SW_STRCASECT(p, pe - p, "HTTP/1.1") || SW_STRCASECT(p, pe - p, "HTTP/1.0")) {
-                state = 1;
-                p += sizeof("HTTP/1.x") - 1;
-            } else {
-                break;
-            }
-        } else if (state == 1) {
-            if (isspace(*p)) {
-                continue;
-            } else {
-                if (SW_STRCASECT(p, pe - p, "200")) {
-                    state = 2;
-                    p += sizeof("200") - 1;
-                } else {
-                    break;
-                }
-            }
-        } else if (state == 2) {
-            ret = true;
-            break;
-#if 0
-            if (isspace(*p)) {
-                continue;
-            } else {
-                if (SW_STRCASECT(p, pe - p, "Connection established")) {
-                    ret = true;
-                }
-                break;
-            }
-#endif
-        }
-    }
-
-    if (!ret) {
+    if (!http_proxy->handshake(recv_buffer)) {
         set_err(SW_ERROR_HTTP_PROXY_BAD_RESPONSE,
                 std::string("wrong http_proxy response received, \n[Request]: ") + send_buffer->to_std_string() +
-                    "\n[Response]: " + std::string(buf, len));
+                    "\n[Response]: " + send_buffer->to_std_string());
+        return false;
     }
 
-    return ret;
+    return true;
 }
 
-void Socket::init_sock_type(SocketType _sw_type) {
-    type = _sw_type;
-    network::Socket::get_domain_and_type(_sw_type, &sock_domain, &sock_type);
+void Socket::init_sock_type(SocketType _type) {
+    type = _type;
+    network::Socket::get_domain_and_type(_type, &sock_domain, &sock_type);
 }
 
 bool Socket::init_sock() {
-    socket = make_socket(type, SW_FD_CO_SOCKET, SW_SOCK_CLOEXEC | SW_SOCK_NONBLOCK);
+    socket =
+        make_socket(type, SW_FD_CO_SOCKET, sock_domain, sock_type, sock_protocol, SW_SOCK_NONBLOCK | SW_SOCK_CLOEXEC);
     if (socket == nullptr) {
         return false;
     }
@@ -478,7 +428,7 @@ bool Socket::init_reactor_socket(int _fd) {
 
 Socket::Socket(int _domain, int _type, int _protocol)
     : sock_domain(_domain), sock_type(_type), sock_protocol(_protocol) {
-    type = network::Socket::convert_to_type(_domain, _type, _protocol);
+    type = network::Socket::convert_to_type(_domain, _type);
     if (sw_unlikely(!init_sock())) {
         return;
     }
@@ -494,17 +444,20 @@ Socket::Socket(SocketType _type) {
 }
 
 Socket::Socket(int _fd, SocketType _type) {
-    init_sock_type(_type);
     if (sw_unlikely(!init_reactor_socket(_fd))) {
         return;
     }
+    if (_type == SW_SOCK_RAW) {
+        return;
+    }
+    init_sock_type(_type);
     socket->set_nonblock();
     init_options();
 }
 
 Socket::Socket(int _fd, int _domain, int _type, int _protocol)
     : sock_domain(_domain), sock_type(_type), sock_protocol(_protocol) {
-    type = network::Socket::convert_to_type(_domain, _type, _protocol);
+    type = network::Socket::convert_to_type(_domain, _type);
     if (sw_unlikely(!init_reactor_socket(_fd))) {
         return;
     }
@@ -580,7 +533,7 @@ bool Socket::connect(const struct sockaddr *addr, socklen_t addrlen) {
         } else {
             TimerController timer(&write_timer, connect_timeout, this, timer_callback);
             if (!timer.start() || !wait_event(SW_EVENT_WRITE)) {
-                if (closed) {
+                if (is_closed()) {
                     set_err(ECONNABORTED);
                 }
                 return false;
@@ -632,7 +585,7 @@ bool Socket::connect(std::string _host, int _port, int flags) {
         _port = http_proxy->proxy_port;
     }
 
-    if (sock_domain == AF_INET6 || sock_domain == AF_INET) {
+    if (is_port_required()) {
         if (_port == -1) {
             set_err(EINVAL, "Socket of type AF_INET/AF_INET6 requires port argument");
             return false;
@@ -725,7 +678,7 @@ bool Socket::connect(std::string _host, int _port, int flags) {
             }
             socket->info.addr.un.sun_family = AF_UNIX;
             memcpy(&socket->info.addr.un.sun_path, connect_host.c_str(), connect_host.size());
-            socket->info.len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + connect_host.size());
+            socket->info.len = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + connect_host.size());
             _target_addr = (struct sockaddr *) &socket->info.addr.un;
             break;
         } else {
@@ -770,8 +723,8 @@ bool Socket::connect(std::string _host, int _port, int flags) {
 }
 
 bool Socket::check_liveness() {
-    if (closed) {
-        set_err(ECONNRESET);
+    if (is_closed()) {
+        set_err(EBADF);
         return false;
     }
     if (!socket->check_liveness()) {
@@ -788,11 +741,15 @@ ssize_t Socket::peek(void *__buf, size_t __n) {
     return retval;
 }
 
-bool Socket::poll(EventType type) {
+bool Socket::poll(EventType type, double timeout) {
     if (sw_unlikely(!is_available(type))) {
         return -1;
     }
-    TimerController timer(&read_timer, read_timeout, this, timer_callback);
+    TimerNode **timer_pp = type == SW_EVENT_READ ? &read_timer : &write_timer;
+    if (timeout == 0) {
+        timeout = type == SW_EVENT_READ ? read_timeout : write_timeout;
+    }
+    TimerController timer(timer_pp, timeout, this, timer_callback);
     if (timer.start() && wait_event(type)) {
         return true;
     } else {
@@ -1189,6 +1146,11 @@ Socket *Socket::accept(double timeout) {
     if (sw_unlikely(!is_available(SW_EVENT_READ))) {
         return nullptr;
     }
+#ifdef SW_USE_OPENSSL
+    if (ssl_is_enable() && sw_unlikely(ssl_context->context == nullptr) && !ssl_context_create()) {
+        return nullptr;
+    }
+#endif
     network::Socket *conn = socket->accept();
     if (conn == nullptr && errno == EAGAIN) {
         TimerController timer(&read_timer, timeout == 0 ? read_timeout : timeout, this, timer_callback);
@@ -1214,10 +1176,7 @@ Socket *Socket::accept(double timeout) {
 }
 
 #ifdef SW_USE_OPENSSL
-bool Socket::ssl_check_context() {
-    if (socket->ssl || (get_ssl_context() && get_ssl_context()->get_context())) {
-        return true;
-    }
+bool Socket::ssl_context_create() {
     if (socket->is_dgram()) {
 #ifdef SW_SUPPORT_DTLS
         socket->dtls = 1;
@@ -1230,7 +1189,6 @@ bool Socket::ssl_check_context() {
     }
     ssl_context->http_v2 = http2;
     if (!ssl_context->create()) {
-        swoole_warning("swSSL_get_context() error");
         return false;
     }
     socket->ssl_send_ = 1;
@@ -1264,12 +1222,20 @@ bool Socket::ssl_handshake() {
     if (sw_unlikely(!is_available(SW_EVENT_RDWR))) {
         return false;
     }
-    if (!ssl_check_context()) {
+    /**
+     * If the ssl_context is empty, it indicates that this socket was not a connection
+     * returned by a server socket accept, and a new ssl_context needs to be created.
+     */
+    if (ssl_context->context == nullptr && !ssl_context_create()) {
         return false;
     }
     if (!ssl_create(get_ssl_context())) {
         return false;
     }
+    /**
+     * The server will use ssl_accept to complete the SSL handshake,
+     * while the client will use ssl_connect.
+     */
     if (!ssl_is_server) {
         while (true) {
             if (socket->ssl_connect() < 0) {
@@ -1324,6 +1290,7 @@ bool Socket::ssl_verify(bool allow_self_signed) {
 
 std::string Socket::ssl_get_peer_cert() {
     if (!socket->ssl_get_peer_certificate(sw_tg_buffer())) {
+        set_err(SW_ERROR_SSL_EMPTY_PEER_CERTIFICATE);
         return "";
     } else {
         return sw_tg_buffer()->to_std_string();
@@ -1355,16 +1322,16 @@ bool Socket::sendfile(const char *filename, off_t offset, size_t length) {
     }
 
     TimerController timer(&write_timer, write_timeout, this, timer_callback);
-    int n, sendn;
+    ssize_t n, sent_bytes;
     while ((size_t) offset < length) {
-        sendn = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
+        sent_bytes = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
 #ifdef SW_USE_OPENSSL
         if (socket->ssl) {
-            n = socket->ssl_sendfile(file, &offset, sendn);
+            n = socket->ssl_sendfile(file, &offset, sent_bytes);
         } else
 #endif
         {
-            n = ::swoole_sendfile(sock_fd, file.get_fd(), &offset, sendn);
+            n = ::swoole_sendfile(sock_fd, file.get_fd(), &offset, sent_bytes);
         }
         if (n > 0) {
             continue;
@@ -1715,41 +1682,39 @@ bool Socket::cancel(const EventType event) {
         write_co->resume();
         return true;
     } else {
+        set_err(EINVAL);
         return false;
     }
 }
 
 /**
- * @return bool (whether it can be freed)
- * you can access errCode member to get error information
+ * @return bool
+ * If true is returned, the related resources of this socket can be released
+ * If false is returned, it means that other coroutines are still referencing this socket,
+ * and need to wait for the coroutine bound to readable or writable event to execute close,
+ * and release when all references are 0
  */
 bool Socket::close() {
-    if (sock_fd < 0) {
+    if (is_closed()) {
         set_err(EBADF);
-        return true;
+        return false;
     }
     if (connected) {
         shutdown();
     }
     if (sw_unlikely(has_bound())) {
-        if (closed) {
-            // close operation is in processing
-            set_err(EINPROGRESS);
-            return false;
-        }
-        closed = true;
-        if (write_co) {
-            set_err(ECONNRESET);
-            write_co->resume();
-        }
-        if (read_co) {
-            set_err(ECONNRESET);
-            read_co->resume();
-        }
+        socket->close_wait = 1;
+        cancel(SW_EVENT_WRITE);
+        cancel(SW_EVENT_READ);
+        set_err(SW_ERROR_CO_SOCKET_CLOSE_WAIT);
         return false;
     } else {
-        sock_fd = -1;
-        closed = true;
+        sock_fd = SW_BAD_SOCKET;
+        if (dtor_ != nullptr) {
+            auto dtor = dtor_;
+            dtor_ = nullptr;
+            dtor(this);
+        }
         return true;
     }
 }
@@ -1793,23 +1758,11 @@ Socket::~Socket() {
     if (socket->socket_type == SW_SOCK_UNIX_DGRAM) {
         ::unlink(socket->info.addr.un.sun_path);
     }
+    if (dtor_ != nullptr) {
+        dtor_(this);
+    }
     socket->free();
 }
 
 }  // namespace coroutine
-
-std::string HttpProxy::get_auth_str() {
-    char auth_buf[256];
-    char encode_buf[512];
-    size_t n = sw_snprintf(auth_buf,
-                           sizeof(auth_buf),
-                           "%.*s:%.*s",
-                           (int) username.length(),
-                           username.c_str(),
-                           (int) password.length(),
-                           password.c_str());
-    base64_encode((unsigned char *) auth_buf, n, encode_buf);
-    return std::string(encode_buf);
-}
-
 }  // namespace swoole

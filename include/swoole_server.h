@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -26,6 +26,10 @@
 #include "swoole_process_pool.h"
 #include "swoole_pipe.h"
 #include "swoole_channel.h"
+#include "swoole_message_bus.h"
+#ifdef SW_THREAD
+#include "swoole_lock.h"
+#endif
 
 #ifdef SW_USE_OPENSSL
 #include "swoole_dtls.h"
@@ -42,6 +46,7 @@
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
+#include <condition_variable>
 
 //------------------------------------Server-------------------------------------------
 namespace swoole {
@@ -52,6 +57,8 @@ struct Request;
 
 class Server;
 struct Manager;
+
+typedef std::function<void(void)> WorkerFn;
 
 struct Session {
     SessionId id;
@@ -79,9 +86,7 @@ struct Connection {
     uint8_t overflow;
     uint8_t high_watermark;
     uint8_t http_upgrade;
-#ifdef SW_USE_HTTP2
     uint8_t http2_stream;
-#endif
 #ifdef SW_HAVE_ZLIB
     uint8_t websocket_compression;
 #endif
@@ -137,166 +142,9 @@ struct Connection {
 
 #ifdef SW_USE_OPENSSL
     String *ssl_client_cert;
-    uint16_t ssl_client_cert_pid;
+    pid_t ssl_client_cert_pid;
 #endif
     sw_atomic_t lock;
-};
-
-struct PipeBuffer {
-    DataHead info;
-    char data[0];
-
-    bool is_begin() {
-        return info.flags & SW_EVENT_DATA_BEGIN;
-    }
-
-    bool is_chunked() {
-        return info.flags & SW_EVENT_DATA_CHUNK;
-    }
-
-    bool is_end() {
-        return info.flags & SW_EVENT_DATA_END;
-    }
-};
-
-//------------------------------------Packet-------------------------------------------
-struct PacketPtr {
-    size_t length;
-    char *data;
-};
-
-struct DgramPacket {
-    SocketType socket_type;
-    network::Address socket_addr;
-    uint32_t length;
-    char data[0];
-};
-
-struct PacketTask {
-    size_t length;
-    char tmpfile[SW_TASK_TMP_PATH_SIZE];
-};
-
-class MessageBus {
-  private:
-    const Allocator *allocator_;
-    std::unordered_map<uint64_t, std::shared_ptr<String>> packet_pool_;
-    std::function<uint64_t(void)> id_generator_;
-    size_t buffer_size_;
-    PipeBuffer *buffer_ = nullptr;
-    bool always_chunked_transfer_ = false;
-
-    String *get_packet_buffer();
-    ReturnCode prepare_packet(uint16_t &recv_chunk_count, String *packet_buffer);
-
-  public:
-    MessageBus() {
-        allocator_ = sw_std_allocator();
-        buffer_size_ = SW_BUFFER_SIZE_STD;
-    }
-
-    ~MessageBus() {
-        allocator_->free(buffer_);
-    }
-
-    bool empty() {
-        return packet_pool_.empty();
-    }
-
-    void clear() {
-        packet_pool_.clear();
-    }
-
-    void set_allocator(const Allocator *allocator) {
-        allocator_ = allocator;
-    }
-
-    void set_id_generator(const std::function<uint64_t(void)> &id_generator) {
-        id_generator_ = id_generator;
-    }
-
-    void set_buffer_size(size_t buffer_size) {
-        buffer_size_ = buffer_size;
-    }
-
-    void set_always_chunked_transfer() {
-        always_chunked_transfer_ = true;
-    }
-
-    size_t get_buffer_size() {
-        return buffer_size_;
-    }
-
-    size_t get_memory_size();
-
-    bool alloc_buffer() {
-        void *_ptr = allocator_->malloc(sizeof(*buffer_) + buffer_size_);
-        if (_ptr) {
-            buffer_ = (PipeBuffer *) _ptr;
-            sw_memset_zero(&buffer_->info, sizeof(buffer_->info));
-            return true;
-        } else {
-            return false;
-        }
-    }
-
-    void pass(SendData *task) {
-        memcpy(&buffer_->info, &task->info, sizeof(buffer_->info));
-        if (task->info.len > 0) {
-            buffer_->info.flags = SW_EVENT_DATA_PTR;
-            PacketPtr pkt{task->info.len, (char *) task->data};
-            buffer_->info.len = sizeof(pkt);
-            memcpy(buffer_->data, &pkt, sizeof(pkt));
-        }
-    }
-
-    /**
-     * Send data to socket. If the data sent is larger than Server::ipc_max_size, then it is sent in chunks.
-     * Otherwise send it directly.
-     * @return: send success returns true, send failure returns false.
-     */
-    bool write(network::Socket *sock, SendData *packet);
-    /**
-     * Receive data from socket, if only one chunk is received, packet will be saved in packet_pool.
-     * Then continue to listen to readable events, waiting for more chunks.
-     * @return: >0: receive a complete packet, 0: continue to wait for data, -1: an error occurred
-     */
-    ssize_t read(network::Socket *sock);
-    /**
-     * Receive data from pipeline, and store data to buffer
-     * @return: >0: receive a complete packet, 0: continue to wait for data, -1: an error occurred
-     */
-    ssize_t read_with_buffer(network::Socket *sock);
-    /**
-     * The last chunk of data has been received, return address and length, start processing this packet.
-     */
-    PacketPtr get_packet() const;
-    PipeBuffer *get_buffer() {
-        return buffer_;
-    }
-    /**
-     * Pop the data memory address to the outer layer, no longer managed by MessageBus
-     */
-    char *move_packet() {
-        uint64_t msg_id = buffer_->info.msg_id;
-        auto iter = packet_pool_.find(msg_id);
-        if (iter != packet_pool_.end()) {
-            auto str = iter->second.get();
-            char *val = str->str;
-            str->str = nullptr;
-            return val;
-        } else {
-            return nullptr;
-        }
-    }
-    /**
-     * The processing of this data packet has been completed, and the relevant memory has been released
-     */
-    void pop() {
-        if (buffer_->is_end()) {
-            packet_pool_.erase(buffer_->info.msg_id);
-        }
-    }
 };
 
 //------------------------------------ReactorThread-------------------------------------------
@@ -304,17 +152,19 @@ struct ReactorThread {
     int id;
     std::thread thread;
     network::Socket *notify_pipe = nullptr;
-    uint32_t pipe_num = 0;
     uint64_t dispatch_count = 0;
-    network::Socket *pipe_sockets = nullptr;
     network::Socket *pipe_command = nullptr;
     MessageBus message_bus;
 
     int init(Server *serv, Reactor *reactor, uint16_t reactor_id);
+    void shutdown(Reactor *reactor);
+    int close_connection(Reactor *reactor, SessionId session_id);
+    void clean();
 };
 
 struct ServerPortGS {
     sw_atomic_t connection_num;
+    sw_atomic_t *connection_nums = nullptr;
     sw_atomic_long_t abort_count;
     sw_atomic_long_t accept_count;
     sw_atomic_long_t close_count;
@@ -348,7 +198,7 @@ struct ListenPort {
 
     int tcp_user_timeout = 0;
 
-    uint16_t max_idle_time = 0;
+    double max_idle_time = 0;
 
     int socket_buffer_size = network::Socket::default_buffer_size;
     uint32_t buffer_high_watermark = 0;
@@ -443,27 +293,31 @@ struct ListenPort {
 
     int (*onRead)(Reactor *reactor, ListenPort *port, Event *event) = nullptr;
 
-    inline bool is_dgram() {
+    bool is_dgram() {
         return network::Socket::is_dgram(type);
     }
 
-    inline bool is_stream() {
+    bool is_stream() {
         return network::Socket::is_stream(type);
     }
 
-    inline void set_eof_protocol(const std::string &eof, bool find_from_right = false) {
+    void set_eof_protocol(const std::string &eof, bool find_from_right = false) {
         open_eof_check = true;
         protocol.split_by_eof = !find_from_right;
         protocol.package_eof_len = std::min(eof.length(), sizeof(protocol.package_eof));
         memcpy(protocol.package_eof, eof.c_str(), protocol.package_eof_len);
     }
 
-    inline void set_length_protocol(uint32_t length_offset, char length_type, uint32_t body_offset) {
+    void set_length_protocol(uint32_t length_offset, char length_type, uint32_t body_offset) {
         open_length_check = true;
         protocol.package_length_type = length_type;
         protocol.package_length_size = swoole_type_size(length_type);
-        protocol.package_body_offset = length_offset;
+        protocol.package_length_offset = length_offset;
         protocol.package_body_offset = body_offset;
+    }
+
+    void set_package_max_length(uint32_t max_length) {
+        protocol.package_max_length = max_length;
     }
 
     ListenPort();
@@ -472,6 +326,8 @@ struct ListenPort {
     void close();
     bool import(int sock);
     const char *get_protocols();
+    int create_socket(Server *server);
+    void close_socket();
 
 #ifdef SW_USE_OPENSSL
     bool ssl_create_context(SSLContext *context);
@@ -487,21 +343,23 @@ struct ListenPort {
     }
 #endif
     void clear_protocol();
-    inline network::Socket *get_socket() {
+    network::Socket *get_socket() {
         return socket;
     }
-    int get_port() {
+    int get_port() const {
         return port;
     }
-    const char *get_host() {
+    const char *get_host() const {
         return host.c_str();
     }
-    SocketType get_type() {
+    SocketType get_type() const {
         return type;
     }
-    int get_fd() {
+    int get_fd() const {
         return socket ? socket->fd : -1;
     }
+
+    size_t get_connection_num() const;
 };
 
 struct ServerGS {
@@ -515,8 +373,10 @@ struct ServerGS {
     int max_fd;
     int min_fd;
 
+    bool called_onStart;
     time_t start_time;
     sw_atomic_t connection_num;
+    sw_atomic_t *connection_nums = nullptr;
     sw_atomic_t tasking_num;
     uint32_t max_concurrency;
     sw_atomic_t concurrency;
@@ -529,13 +389,11 @@ struct ServerGS {
     sw_atomic_long_t total_recv_bytes;
     sw_atomic_long_t total_send_bytes;
     sw_atomic_long_t pipe_packet_msg_id;
+    sw_atomic_long_t task_count;
 
     sw_atomic_t spinlock;
 
-#ifdef HAVE_PTHREAD_BARRIER
-    pthread_barrier_t manager_barrier;
-    pthread_barrierattr_t manager_barrier_attr;
-#endif
+    Barrier manager_barrier;
 
     ProcessPool task_workers;
     ProcessPool event_workers;
@@ -549,6 +407,13 @@ class Factory {
     Factory(Server *_server) {
         server_ = _server;
     }
+    pid_t spawn_event_worker(Worker *worker);
+    pid_t spawn_user_worker(Worker *worker);
+    pid_t spawn_task_worker(Worker *worker);
+    void kill_user_workers();
+    void kill_event_workers();
+    void kill_task_workers();
+    void check_worker_exit_status(Worker *worker, const ExitStatus &exit_status);
     virtual ~Factory() {}
     virtual bool start() = 0;
     virtual bool shutdown() = 0;
@@ -560,7 +425,7 @@ class Factory {
 
 class BaseFactory : public Factory {
   public:
-    BaseFactory(Server *server) : Factory(server) {}
+    BaseFactory(Server *server);
     ~BaseFactory();
     bool start() override;
     bool shutdown() override;
@@ -568,12 +433,10 @@ class BaseFactory : public Factory {
     bool finish(SendData *) override;
     bool notify(DataHead *) override;
     bool end(SessionId sesion_id, int flags) override;
+    bool forward_message(Session *session, SendData *data);
 };
 
 class ProcessFactory : public Factory {
-  private:
-    std::vector<std::shared_ptr<UnixSocket>> pipes;
-
   public:
     ProcessFactory(Server *server);
     ~ProcessFactory();
@@ -583,6 +446,36 @@ class ProcessFactory : public Factory {
     bool finish(SendData *) override;
     bool notify(DataHead *) override;
     bool end(SessionId sesion_id, int flags) override;
+};
+
+class ThreadFactory : public BaseFactory {
+  private:
+    std::vector<std::thread> threads_;
+    std::mutex lock_;
+    std::condition_variable cv_;
+    std::queue<Worker *> queue_;
+    long cv_timeout_ms_;
+    bool reload_all_workers;
+    bool reloading;
+    Worker manager;
+    template <typename _Callable>
+    void create_thread(int i, _Callable fn);
+    void join_thread(std::thread &thread);
+    void at_thread_exit(Worker *worker);
+    void create_message_bus();
+    void destroy_message_bus();
+
+  public:
+    ThreadFactory(Server *server);
+    ~ThreadFactory();
+    void spawn_event_worker(WorkerId i);
+    void spawn_task_worker(WorkerId i);
+    void spawn_user_worker(WorkerId i);
+    void spawn_manager_thread(WorkerId i);
+    void wait();
+    bool reload(bool reload_all_workers);
+    bool start() override;
+    bool shutdown() override;
 };
 
 enum ServerEventType {
@@ -637,6 +530,7 @@ class Server {
     enum Mode {
         MODE_BASE = 1,
         MODE_PROCESS = 2,
+        MODE_THREAD = 3,
     };
 
     enum TaskIpcMode {
@@ -647,9 +541,11 @@ class Server {
     };
 
     enum ThreadType {
+        THREAD_NORMAL = 0,
         THREAD_MASTER = 1,
         THREAD_REACTOR = 2,
         THREAD_HEARTBEAT = 3,
+        THREAD_WORKER = 4,
     };
 
     enum DispatchMode {
@@ -659,7 +555,6 @@ class Server {
         DISPATCH_IPMOD = 4,
         DISPATCH_UIDMOD = 5,
         DISPATCH_USERFUNC = 6,
-        DISPATCH_STREAM = 7,
         DISPATCH_CO_CONN_LB = 8,
         DISPATCH_CO_REQ_LB = 9,
         DISPATCH_CONCURRENT_LB = 10,
@@ -871,17 +766,26 @@ class Server {
     void *private_data_1 = nullptr;
     void *private_data_2 = nullptr;
     void *private_data_3 = nullptr;
+    void *private_data_4 = nullptr;
 
     Factory *factory = nullptr;
     Manager *manager = nullptr;
 
     std::vector<ListenPort *> ports;
+    std::vector<std::shared_ptr<UnixSocket>> worker_pipes;
 
-    inline ListenPort *get_primary_port() {
+    ListenPort *get_primary_port() {
         return ports.front();
     }
 
-    inline ListenPort *get_port(int _port) {
+    enum Mode get_mode() const {
+        return mode_;
+    };
+
+    /**
+     * This method can only be used for INET ports and cannot obtain Unix socket ports.
+     */
+    ListenPort *get_port(int _port) const {
         for (auto port : ports) {
             if (port->port == _port || _port == 0) {
                 return port;
@@ -890,15 +794,24 @@ class Server {
         return nullptr;
     }
 
-    inline ListenPort *get_port_by_server_fd(int server_fd) {
+    ListenPort *get_port(SocketType type, const char *host, int _port) const {
+        for (auto port : ports) {
+            if (port->port == _port && port->type == type && strcmp(host, port->host.c_str()) == 0) {
+                return port;
+            }
+        }
+        return nullptr;
+    }
+
+    ListenPort *get_port_by_server_fd(int server_fd) const {
         return (ListenPort *) connection_list[server_fd].object;
     }
 
-    inline ListenPort *get_port_by_fd(int fd) {
+    ListenPort *get_port_by_fd(int fd) const {
         return get_port_by_server_fd(connection_list[fd].server_fd);
     }
 
-    inline ListenPort *get_port_by_session_id(SessionId session_id) {
+    ListenPort *get_port_by_session_id(SessionId session_id) const {
         Connection *conn = get_connection_by_session_id(session_id);
         if (!conn) {
             return nullptr;
@@ -906,25 +819,26 @@ class Server {
         return get_port_by_fd(conn->fd);
     }
 
-    inline network::Socket *get_server_socket(int fd) {
+    network::Socket *get_server_socket(int fd) const {
         return connection_list[fd].socket;
-    }
-
-    /**
-     * [ReactorThread]
-     */
-    network::Socket *get_worker_pipe_socket(Worker *worker) {
-        return &get_thread(SwooleTG.id)->pipe_sockets[worker->pipe_master->fd];
     }
 
     network::Socket *get_command_reply_socket() {
         return is_base_mode() ? get_worker(0)->pipe_master : pipe_command->get_socket(false);
     }
 
+    network::Socket *get_worker_pipe_master(WorkerId id) {
+        return get_worker(id)->pipe_master;
+    }
+
+    network::Socket *get_worker_pipe_worker(WorkerId id) {
+        return get_worker(id)->pipe_worker;
+    }
+
     /**
      * [Worker|Master]
      */
-    inline network::Socket *get_reactor_pipe_socket(SessionId session_id, int reactor_id) {
+    network::Socket *get_reactor_pipe_socket(SessionId session_id, int reactor_id) {
         int pipe_index = session_id % reactor_pipe_num;
         /**
          * pipe_worker_id: The pipe in which worker.
@@ -942,13 +856,15 @@ class Server {
     uint32_t task_max_request = 0;
     uint32_t task_max_request_grace = 0;
     std::vector<std::shared_ptr<Pipe>> task_notify_pipes;
-    EventData *task_result = nullptr;
+    EventData *task_results = nullptr;
 
     /**
-     * user process
+     * Used for process management, saving the mapping relationship between PID and worker pointers
      */
-    std::vector<Worker *> user_worker_list;
     std::unordered_map<pid_t, Worker *> user_worker_map;
+    /**
+     * Shared memory, sharing state between processes
+     */
     Worker *user_workers = nullptr;
 
     std::unordered_map<std::string, Command> commands;
@@ -960,36 +876,30 @@ class Server {
     Worker *workers = nullptr;
     ServerGS *gs = nullptr;
 
-    std::unordered_set<std::string> *types = nullptr;
-    std::unordered_set<std::string> *locations = nullptr;
-    std::vector<std::string> *http_index_files = nullptr;
+    std::shared_ptr<std::unordered_set<std::string>> locations = nullptr;
+    std::shared_ptr<std::vector<std::string>> http_index_files = nullptr;
+    std::shared_ptr<std::unordered_set<std::string>> http_compression_types = nullptr;
 
-#ifdef HAVE_PTHREAD_BARRIER
-    pthread_barrier_t reactor_thread_barrier = {};
-#endif
+    Barrier reactor_thread_barrier = {};
 
     /**
      * temporary directory for HTTP uploaded file.
      */
     std::string upload_tmp_dir = "/tmp";
     /**
+     * Write the uploaded file in form-data to disk file
+     */
+    size_t upload_max_filesize = 0;
+    /**
      * http compression level for gzip/br
      */
-#ifdef SW_HAVE_COMPRESSION
     uint8_t http_compression_level = 0;
     uint32_t compression_min_length;
-#endif
     /**
      * master process pid
      */
     std::string pid_file;
-    /**
-     * stream
-     */
-    char *stream_socket_file = nullptr;
-    network::Socket *stream_socket = nullptr;
-    Protocol stream_protocol = {};
-    network::Socket *last_stream_socket = nullptr;
+
     EventData *last_task = nullptr;
     std::queue<String *> *buffer_pool = nullptr;
 
@@ -1017,16 +927,16 @@ class Server {
      */
     std::function<void(Server *)> onManagerStart;
     std::function<void(Server *)> onManagerStop;
-    std::function<void(Server *, int, const ExitStatus &)> onWorkerError;
+    std::function<void(Server *, Worker *, const ExitStatus &)> onWorkerError;
     std::function<void(Server *)> onBeforeReload;
     std::function<void(Server *)> onAfterReload;
     /**
      * Worker Process
      */
     std::function<void(Server *, EventData *)> onPipeMessage;
-    std::function<void(Server *, uint32_t)> onWorkerStart;
-    std::function<void(Server *, uint32_t)> onWorkerStop;
-    std::function<void(Server *, uint32_t)> onWorkerExit;
+    std::function<void(Server *, Worker *)> onWorkerStart;
+    std::function<void(Server *, Worker *)> onWorkerStop;
+    std::function<void(Server *, Worker *)> onWorkerExit;
     std::function<void(Server *, Worker *)> onUserWorkerStart;
     /**
      * Connection
@@ -1042,7 +952,10 @@ class Server {
      */
     std::function<int(Server *, EventData *)> onTask;
     std::function<int(Server *, EventData *)> onFinish;
-
+    /**
+     * for MessageBus
+     */
+    std::function<uint64_t(void)> msg_id_generator;
     /**
      * Hook
      */
@@ -1071,10 +984,20 @@ class Server {
     void add_static_handler_location(const std::string &);
     void add_static_handler_index_files(const std::string &);
     bool select_static_handler(http_server::Request *request, Connection *conn);
+    void add_http_compression_type(const std::string &type);
 
     int create();
+    Factory *create_base_factory();
+    Factory *create_thread_factory();
+    Factory *create_process_factory();
+    bool create_worker_pipes();
+    void destroy_base_factory();
+    void destroy_thread_factory();
+    void destroy_process_factory();
+
     int start();
-    void shutdown();
+    bool reload(bool reload_all_workers);
+    bool shutdown();
 
     int add_worker(Worker *worker);
     ListenPort *add_port(SocketType type, const char *host, int port);
@@ -1083,36 +1006,62 @@ class Server {
     bool add_command(const std::string &command, int accepted_process_types, const Command::Handler &func);
     Connection *add_connection(ListenPort *ls, network::Socket *_socket, int server_fd);
     void abort_connection(Reactor *reactor, ListenPort *ls, network::Socket *_socket);
+    void abort_worker(Worker *worker);
+    void reset_worker_counter(Worker *worker);
     int connection_incoming(Reactor *reactor, Connection *conn);
 
     int get_idle_worker_num();
     int get_idle_task_worker_num();
-    int get_task_count();
+    int get_tasking_num();
 
-    inline int get_minfd() {
+    TaskId get_task_id(EventData *task) {
+        return gs->task_workers.get_task_id(task);
+    }
+
+    uint16_t get_command_id(EventData *cmd) {
+        return cmd->info.server_fd;
+    }
+
+    EventData *get_task_result() {
+        return &(task_results[swoole_get_process_id()]);
+    }
+
+    WorkerId get_task_src_worker_id(EventData *task) {
+        return gs->task_workers.get_task_src_worker_id(task);
+    }
+
+    int get_minfd() {
         return gs->min_fd;
     }
 
-    inline int get_maxfd() {
+    int get_maxfd() {
         return gs->max_fd;
     }
 
-    inline void set_maxfd(int maxfd) {
+    void set_maxfd(int maxfd) {
         gs->max_fd = maxfd;
     }
 
-    inline void set_minfd(int minfd) {
+    void set_minfd(int minfd) {
         gs->min_fd = minfd;
+    }
+
+    pid_t get_master_pid() {
+        return gs->master_pid;
+    }
+
+    pid_t get_manager_pid() {
+        return gs->manager_pid;
     }
 
     void store_listen_socket();
     void store_pipe_fd(UnixSocket *p);
 
-    inline const std::string &get_document_root() {
+    const std::string &get_document_root() {
         return document_root;
     }
 
-    inline String *get_recv_buffer(swSocket *_socket) {
+    String *get_recv_buffer(network::Socket *_socket) {
         String *buffer = _socket->recv_buffer;
         if (buffer == nullptr) {
             buffer = swoole::make_string(SW_BUFFER_SIZE_BIG, recv_buffer_allocator);
@@ -1125,28 +1074,39 @@ class Server {
         return buffer;
     }
 
-    inline uint32_t get_worker_buffer_num() {
+    MessageBus *get_worker_message_bus() {
+#ifdef SW_THREAD
+        return sw_likely(is_thread_mode()) ? SwooleTG.message_bus : &message_bus;
+#else
+        return &message_bus;
+#endif
+    }
+
+    uint32_t get_worker_buffer_num() {
         return is_base_mode() ? 1 : reactor_num + dgram_port_num;
     }
 
-    inline bool is_support_unsafe_events() {
-        if (dispatch_mode != DISPATCH_ROUND && dispatch_mode != DISPATCH_IDLE_WORKER &&
-            dispatch_mode != DISPATCH_STREAM) {
+    bool is_support_unsafe_events() {
+        if (is_hash_dispatch_mode()) {
             return true;
         } else {
             return enable_unsafe_event;
         }
     }
 
-    inline bool is_process_mode() {
+    bool is_process_mode() {
         return mode_ == MODE_PROCESS;
     }
 
-    inline bool is_base_mode() {
+    bool is_base_mode() {
         return mode_ == MODE_BASE;
     }
 
-    inline bool is_enable_coroutine() {
+    bool is_thread_mode() {
+        return mode_ == MODE_THREAD;
+    }
+
+    bool is_enable_coroutine() {
         if (is_task_worker()) {
             return task_enable_coroutine;
         } else if (is_manager()) {
@@ -1156,16 +1116,20 @@ class Server {
         }
     }
 
-    inline bool is_hash_dispatch_mode() {
+    bool is_master_thread() {
+        return swoole_get_thread_type() == Server::THREAD_MASTER;
+    }
+
+    bool is_hash_dispatch_mode() {
         return dispatch_mode == DISPATCH_FDMOD || dispatch_mode == DISPATCH_IPMOD ||
                dispatch_mode == DISPATCH_CO_CONN_LB;
     }
 
-    inline bool is_support_send_yield() {
+    bool is_support_send_yield() {
         return is_hash_dispatch_mode();
     }
 
-    inline bool if_require_packet_callback(ListenPort *port, bool isset) {
+    bool if_require_packet_callback(ListenPort *port, bool isset) {
 #ifdef SW_USE_OPENSSL
         return (port->is_dgram() && !port->ssl && !isset);
 #else
@@ -1173,7 +1137,7 @@ class Server {
 #endif
     }
 
-    inline bool if_require_receive_callback(ListenPort *port, bool isset) {
+    bool if_require_receive_callback(ListenPort *port, bool isset) {
 #ifdef SW_USE_OPENSSL
         return (((port->is_dgram() && port->ssl) || port->is_stream()) && !isset);
 #else
@@ -1181,7 +1145,11 @@ class Server {
 #endif
     }
 
-    inline Worker *get_worker(uint16_t worker_id) {
+    bool if_forward_message(Session *session) {
+        return session->reactor_id != swoole_get_process_id();
+    }
+
+    Worker *get_worker(uint16_t worker_id) {
         // Event Worker
         if (worker_id < worker_num) {
             return &(gs->event_workers.workers[worker_id]);
@@ -1202,25 +1170,32 @@ class Server {
         return nullptr;
     }
 
+    bool kill_worker(WorkerId worker_id, bool wait_reactor);
     void stop_async_worker(Worker *worker);
+    void stop_master_thread();
+    void join_heartbeat_thread();
 
-    inline Pipe *get_pipe_object(int pipe_fd) {
+    Pipe *get_pipe_object(int pipe_fd) {
         return (Pipe *) connection_list[pipe_fd].object;
     }
 
     size_t get_all_worker_num() {
-        return worker_num + task_worker_num + get_user_worker_num();
+        return get_core_worker_num() + get_user_worker_num();
     }
 
     size_t get_user_worker_num() {
         return user_worker_list.size();
     }
 
-    inline ReactorThread *get_thread(int reactor_id) {
+    size_t get_core_worker_num() {
+        return worker_num + task_worker_num;
+    }
+
+    ReactorThread *get_thread(int reactor_id) {
         return &reactor_threads[reactor_id];
     }
 
-    inline bool is_started() {
+    bool is_started() {
         return gs->start;
     }
 
@@ -1228,28 +1203,48 @@ class Server {
         return factory != nullptr;
     }
 
+    bool is_running() {
+        return running;
+    }
+
     bool is_master() {
-        return SwooleG.process_type == SW_PROCESS_MASTER;
+        return swoole_get_process_type() == SW_PROCESS_MASTER;
     }
 
     bool is_worker() {
-        return SwooleG.process_type == SW_PROCESS_WORKER;
+        return swoole_get_process_type() == SW_PROCESS_EVENTWORKER;
+    }
+
+    bool is_event_worker() {
+        return is_worker();
     }
 
     bool is_task_worker() {
-        return SwooleG.process_type == SW_PROCESS_TASKWORKER;
+        return swoole_get_process_type() == SW_PROCESS_TASKWORKER;
     }
 
     bool is_manager() {
-        return SwooleG.process_type == SW_PROCESS_MANAGER;
+        return swoole_get_process_type() == SW_PROCESS_MANAGER;
     }
 
     bool is_user_worker() {
-        return SwooleG.process_type == SW_PROCESS_USERWORKER;
+        return swoole_get_process_type() == SW_PROCESS_USERWORKER;
+    }
+
+    bool is_worker_thread() {
+        return is_thread_mode() && swoole_get_thread_type() == Server::THREAD_WORKER;
+    }
+
+    bool is_worker_process() {
+        return !is_thread_mode() && (is_worker() || is_task_worker());
     }
 
     bool is_reactor_thread() {
-        return SwooleG.process_type == SW_PROCESS_MASTER && SwooleTG.type == Server::THREAD_REACTOR;
+        return swoole_get_thread_type() == Server::THREAD_REACTOR;
+    }
+
+    bool is_single_worker() {
+        return (worker_num == 1 && task_worker_num == 0 && max_request == 0 && get_user_worker_num() == 0);
     }
 
     bool isset_hook(enum HookType type) {
@@ -1266,12 +1261,12 @@ class Server {
         }
         return false;
     }
-    inline bool is_shutdown() {
+    bool is_shutdown() {
         return gs->shutdown;
     }
 
     // can only be used in the main process
-    inline bool is_valid_connection(Connection *conn) {
+    bool is_valid_connection(Connection *conn) {
         return (conn && conn->socket && conn->active && conn->socket->fd_type == SW_FD_SESSION);
     }
 
@@ -1303,11 +1298,11 @@ class Server {
         }
     }
 
-    inline int get_connection_fd(SessionId session_id) {
+    int get_connection_fd(SessionId session_id) const {
         return session_list[session_id % SW_SESSION_LIST_SIZE].fd;
     }
 
-    inline Connection *get_connection_verify_no_ssl(SessionId session_id) {
+    Connection *get_connection_verify_no_ssl(SessionId session_id) {
         Session *session = get_session(session_id);
         int fd = session->fd;
         Connection *conn = get_connection(fd);
@@ -1320,7 +1315,7 @@ class Server {
         return conn;
     }
 
-    inline Connection *get_connection_verify(SessionId session_id) {
+    Connection *get_connection_verify(SessionId session_id) {
         Connection *conn = get_connection_verify_no_ssl(session_id);
 #ifdef SW_USE_OPENSSL
         if (conn && conn->ssl && !conn->ssl_ready) {
@@ -1330,14 +1325,14 @@ class Server {
         return conn;
     }
 
-    inline Connection *get_connection(int fd) {
+    Connection *get_connection(int fd) const {
         if ((uint32_t) fd > max_connection) {
             return nullptr;
         }
         return &connection_list[fd];
     }
 
-    inline Connection *get_connection_for_iterator(int fd) {
+    Connection *get_connection_for_iterator(int fd) {
         Connection *conn = get_connection(fd);
         if (conn && conn->active && !conn->closed) {
 #ifdef SW_USE_OPENSSL
@@ -1350,23 +1345,14 @@ class Server {
         return nullptr;
     }
 
-    inline Connection *get_connection_by_session_id(SessionId session_id) {
+    Connection *get_connection_by_session_id(SessionId session_id) const {
         return get_connection(get_connection_fd(session_id));
     }
 
-    inline Session *get_session(SessionId session_id) {
+    Session *get_session(SessionId session_id) {
         return &session_list[session_id % SW_SESSION_LIST_SIZE];
     }
 
-    inline void lock() {
-        lock_.lock();
-    }
-
-    inline void unlock() {
-        lock_.unlock();
-    }
-
-    void close_port(bool only_stream_port);
     void clear_timer();
     static void timer_callback(Timer *timer, TimerNode *tnode);
 
@@ -1376,7 +1362,9 @@ class Server {
 
     void call_hook(enum HookType type, void *arg);
     void call_worker_start_callback(Worker *worker);
-    ResultCode call_command_handler(MessageBus &mb, uint16_t worker_id, network::Socket *sock);
+    void call_worker_stop_callback(Worker *worker);
+    void call_worker_error_callback(Worker *worker, const ExitStatus &status);
+    void call_command_handler(MessageBus &mb, uint16_t worker_id, network::Socket *sock);
     std::string call_command_handler_in_master(int command_id, const std::string &msg);
     void call_command_callback(int64_t request_id, const std::string &result);
     void foreach_connection(const std::function<void(Connection *)> &callback);
@@ -1392,11 +1380,10 @@ class Server {
     ssize_t send_to_worker_from_worker(Worker *dst_worker, const void *buf, size_t len, int flags);
 
     ssize_t send_to_worker_from_worker(WorkerId id, EventData *data, int flags) {
-        return send_to_worker_from_worker(get_worker(id), data, sizeof(data->info) + data->info.len, flags);
+        return send_to_worker_from_worker(get_worker(id), data, data->size(), flags);
     }
 
     ssize_t send_to_reactor_thread(const EventData *ev_data, size_t sendn, SessionId session_id);
-    int reply_task_result(const char *data, size_t data_len, int flags, EventData *current_task);
 
     bool send(SessionId session_id, const void *data, uint32_t length);
     bool sendfile(SessionId session_id, const char *file, uint32_t l_file, off_t offset, size_t length);
@@ -1411,12 +1398,18 @@ class Server {
                  const std::string &msg,
                  const Command::Callback &fn);
 
+    bool task(EventData *task, int *dst_worker_id, bool blocking = false);
+    bool finish(const char *data, size_t data_len, int flags, EventData *current_task);
+    bool task_sync(EventData *task, int *dst_worker_id, double timeout);
+    bool send_pipe_message(WorkerId worker_id, EventData *msg);
+
     void init_reactor(Reactor *reactor);
-    void init_worker(Worker *worker);
+    void init_event_worker(Worker *worker);
     void init_task_workers();
     void init_port_protocol(ListenPort *port);
     void init_signal_handler();
     void init_ipc_max_size();
+    void init_pipe_sockets(MessageBus *mb);
 
     void set_max_connection(uint32_t _max_connection);
 
@@ -1470,34 +1463,56 @@ class Server {
 
     int schedule_worker(int fd, SendData *data);
 
-    /**
-     * [Manager]
-     */
-    pid_t spawn_event_worker(Worker *worker);
-    pid_t spawn_user_worker(Worker *worker);
-    pid_t spawn_task_worker(Worker *worker);
-
-    void kill_user_workers();
-    void kill_event_workers();
-    void kill_task_workers();
+    size_t get_connection_num() const {
+        if (gs->connection_nums) {
+            size_t num = 0;
+            for (uint32_t i = 0; i < worker_num; i++) {
+                num += gs->connection_nums[i];
+            }
+            return num;
+        } else {
+            return gs->connection_num;
+        }
+    }
 
     static int wait_other_worker(ProcessPool *pool, const ExitStatus &exit_status);
     static void read_worker_message(ProcessPool *pool, EventData *msg);
 
     void drain_worker_pipe();
-
-    void check_worker_exit_status(int worker_id, const ExitStatus &exit_status);
+    void clean_worker_connections(Worker *worker);
 
     /**
      * [Worker]
      */
-    void worker_start_callback();
-    void worker_stop_callback();
+    void worker_start_callback(Worker *worker);
+    void worker_stop_callback(Worker *worker);
     void worker_accept_event(DataHead *info);
+    void worker_signal_init(void);
+
+    std::function<void(const WorkerFn &fn)> worker_thread_start;
+    std::function<void(pthread_t ptid)> worker_thread_join;
+    std::function<int(pthread_t ptid)> worker_thread_get_exit_status;
+
+    /**
+     * [Master]
+     */
+    bool signal_handler_shutdown();
+    bool signal_handler_child_exit();
+    bool signal_handler_reload(bool reload_all_workers);
+    bool signal_handler_read_message();
+    bool signal_handler_reopen_logger();
+
     static void worker_signal_handler(int signo);
-    static void worker_signal_init(void);
+    static int reactor_process_main_loop(ProcessPool *pool, Worker *worker);
+    static void reactor_thread_main_loop(Server *serv, int reactor_id);
     static bool task_pack(EventData *task, const void *data, size_t data_len);
     static bool task_unpack(EventData *task, String *buffer, PacketPtr *packet);
+    static void master_signal_handler(int signo);
+
+    int start_master_thread(Reactor *reactor);
+    int start_event_worker(Worker *worker);
+    void start_heartbeat_thread();
+    const char *get_startup_error_message();
 
   private:
     enum Mode mode_;
@@ -1517,19 +1532,19 @@ class Server {
      */
     uint16_t reactor_pipe_num = 0;
     ReactorThread *reactor_threads = nullptr;
+    /**
+     * Only used for temporarily saving pointers in add_worker()
+     */
+    std::vector<Worker *> user_worker_list;
 
     int start_check();
     void check_port_type(ListenPort *ls);
     void destroy();
-    void destroy_reactor_threads();
-    void destroy_reactor_processes();
-    int create_reactor_processes();
-    int create_reactor_threads();
     int start_reactor_threads();
     int start_reactor_processes();
-    int start_master_thread();
-    int start_event_worker(Worker *worker);
-    void start_heartbeat_thread();
+    int start_worker_threads();
+    void stop_worker_threads();
+    bool reload_worker_threads(bool reload_all_workers);
     void join_reactor_thread();
     TimerCallback get_timeout_callback(ListenPort *port, Reactor *reactor, Connection *conn);
 
@@ -1564,7 +1579,7 @@ class Server {
         uint32_t key = 0;
         SW_LOOP_N(worker_num + 1) {
             key = sw_atomic_fetch_add(&worker_round_id, 1) % worker_num;
-            if (workers[key].status == SW_WORKER_IDLE) {
+            if (workers[key].is_idle()) {
                 found = true;
                 break;
             }
@@ -1574,6 +1589,14 @@ class Server {
         }
         swoole_trace_log(SW_TRACE_SERVER, "schedule=%d, round=%d", key, worker_round_id);
         return key;
+    }
+
+    void lock() {
+        lock_.lock();
+    }
+
+    void unlock() {
+        lock_.unlock();
     }
 };
 

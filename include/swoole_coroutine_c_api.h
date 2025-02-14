@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -32,11 +32,15 @@ extern "C" {
 #include <poll.h>
 #include <dirent.h>
 
+#ifdef __APPLE__
+extern int fdatasync(int);
+#endif
+
 /**
  * base
  */
-uint8_t swoole_coroutine_is_in();
-long swoole_coroutine_get_current_id();
+uint8_t swoole_coroutine_is_in(void);
+long swoole_coroutine_get_current_id(void);
 void swoole_coroutine_sleep(int sec);
 void swoole_coroutine_usleep(int usec);
 /**
@@ -48,6 +52,8 @@ ssize_t swoole_coroutine_read(int fd, void *buf, size_t count);
 ssize_t swoole_coroutine_write(int fd, const void *buf, size_t count);
 off_t swoole_coroutine_lseek(int fd, off_t offset, int whence);
 int swoole_coroutine_fstat(int fd, struct stat *statbuf);
+int swoole_coroutine_stat(const char *path, struct stat *statbuf);
+int swoole_coroutine_lstat(const char *path, struct stat *statbuf);
 int swoole_coroutine_readlink(const char *pathname, char *buf, size_t len);
 int swoole_coroutine_unlink(const char *pathname);
 int swoole_coroutine_mkdir(const char *pathname, mode_t mode);
@@ -56,6 +62,29 @@ int swoole_coroutine_rename(const char *oldpath, const char *newpath);
 int swoole_coroutine_flock(int fd, int operation);
 int swoole_coroutine_flock_ex(const char *filename, int fd, int operation);
 int swoole_coroutine_statvfs(const char *path, struct statvfs *buf);
+int swoole_coroutine_close_file(int fd);
+int swoole_coroutine_fsync(int fd);
+int swoole_coroutine_fdatasync(int fd);
+/**
+ * io_uring
+ */
+#ifdef SW_USE_IOURING
+int swoole_coroutine_iouring_open(const char *pathname, int flags, mode_t mode);
+int swoole_coroutine_iouring_close_file(int fd);
+ssize_t swoole_coroutine_iouring_read(int sockfd, void *buf, size_t count);
+ssize_t swoole_coroutine_iouring_write(int sockfd, const void *buf, size_t count);
+int swoole_coroutine_iouring_rename(const char *oldpath, const char *newpath);
+int swoole_coroutine_iouring_mkdir(const char *pathname, mode_t mode);
+int swoole_coroutine_iouring_unlink(const char *pathname);
+#ifdef HAVE_IOURING_STATX
+int swoole_coroutine_iouring_fstat(int fd, struct stat *statbuf);
+int swoole_coroutine_iouring_stat(const char *path, struct stat *statbuf);
+int swoole_coroutine_iouring_lstat(const char *path, struct stat *statbuf);
+#endif
+int swoole_coroutine_iouring_rmdir(const char *pathname);
+int swoole_coroutine_iouring_fsync(int fd);
+int swoole_coroutine_iouring_fdatasync(int fd);
+#endif
 /**
  * stdio
  */
@@ -79,6 +108,7 @@ int swoole_coroutine_closedir(DIR *dirp);
  */
 int swoole_coroutine_socket(int domain, int type, int protocol);
 int swoole_coroutine_socket_create(int fd);
+int swoole_coroutine_socket_unwrap(int fd);
 uint8_t swoole_coroutine_socket_exists(int fd);
 ssize_t swoole_coroutine_send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t swoole_coroutine_sendmsg(int sockfd, const struct msghdr *msg, int flags);
@@ -87,6 +117,7 @@ ssize_t swoole_coroutine_recvmsg(int sockfd, struct msghdr *msg, int flags);
 int swoole_coroutine_close(int fd);
 int swoole_coroutine_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int swoole_coroutine_poll(struct pollfd *fds, nfds_t nfds, int timeout);
+int swoole_coroutine_poll_fake(struct pollfd *fds, nfds_t nfds, int timeout);
 int swoole_coroutine_socket_set_timeout(int fd, int which, double timeout);
 int swoole_coroutine_socket_set_connect_timeout(int fd, double timeout);
 int swoole_coroutine_socket_wait_event(int fd, int event, double timeout);
@@ -98,7 +129,7 @@ struct hostent *swoole_coroutine_gethostbyname(const char *name);
 /**
  * wait
  */
-size_t swoole_coroutine_wait_count();
+size_t swoole_coroutine_wait_count(void);
 pid_t swoole_coroutine_waitpid(pid_t __pid, int *__stat_loc, int __options);
 pid_t swoole_coroutine_wait(int *__stat_loc);
 

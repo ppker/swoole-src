@@ -16,16 +16,15 @@
 #include "php_swoole_cxx.h"
 #include "php_swoole_library.h"
 #include "php_swoole_process.h"
-
-#if (HAVE_PCRE || HAVE_BUNDLED_PCRE) && !defined(COMPILE_DL_PCRE)
-#include "ext/pcre/php_pcre.h"
-#endif
-#include "zend_exceptions.h"
+#include "php_swoole_thread.h"
+#include "swoole_iouring.h"
 
 BEGIN_EXTERN_C()
-#ifdef SW_USE_JSON
+#include "zend_exceptions.h"
+#include "zend_extensions.h"
+
+#include "ext/pcre/php_pcre.h"
 #include "ext/json/php_json.h"
-#endif
 
 #include "stubs/php_swoole_arginfo.h"
 #include "stubs/php_swoole_ex_arginfo.h"
@@ -34,12 +33,16 @@ END_EXTERN_C()
 #include "swoole_mime_type.h"
 #include "swoole_server.h"
 #include "swoole_util.h"
+#include "swoole_http2.h"
 
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <ifaddrs.h>
 #include <sys/ioctl.h>
+#ifdef SW_USE_CURL
+#include <curl/curl.h>
+#endif
 
 #if defined(__MACH__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 #include <net/if_dl.h>
@@ -52,6 +55,9 @@ END_EXTERN_C()
 #include <brotli/encode.h>
 #include <brotli/decode.h>
 #endif
+#ifdef SW_HAVE_ZSTD
+#include <zstd.h>
+#endif
 
 #ifdef SW_USE_CARES
 #include <ares.h>
@@ -59,6 +65,9 @@ END_EXTERN_C()
 
 using swoole::Server;
 using swoole::network::Socket;
+#ifdef SW_USE_IOURING
+using swoole::Iouring;
+#endif
 
 ZEND_DECLARE_MODULE_GLOBALS(swoole)
 
@@ -85,10 +94,9 @@ static PHP_FUNCTION(swoole_mime_type_get);
 static PHP_FUNCTION(swoole_mime_type_exists);
 static PHP_FUNCTION(swoole_mime_type_list);
 static PHP_FUNCTION(swoole_substr_unserialize);
-#ifdef SW_USE_JSON
 static PHP_FUNCTION(swoole_substr_json_decode);
-#endif
 static PHP_FUNCTION(swoole_internal_call_user_shutdown_begin);
+static PHP_FUNCTION(swoole_implicit_fn);
 SW_EXTERN_C_END
 
 // clang-format off
@@ -126,10 +134,10 @@ const zend_function_entry swoole_functions[] = {
     PHP_FE(swoole_mime_type_list,     arginfo_swoole_mime_type_list)
     PHP_FE(swoole_clear_dns_cache,    arginfo_swoole_clear_dns_cache)
     PHP_FE(swoole_substr_unserialize, arginfo_swoole_substr_unserialize)
-#ifdef SW_USE_JSON
     PHP_FE(swoole_substr_json_decode, arginfo_swoole_substr_json_decode)
-#endif
     PHP_FE(swoole_internal_call_user_shutdown_begin, arginfo_swoole_internal_call_user_shutdown_begin)
+    // for test
+    PHP_FE(swoole_implicit_fn,           arginfo_swoole_implicit_fn)
     // for admin server
     ZEND_FE(swoole_get_objects,          arginfo_swoole_get_objects)
     ZEND_FE(swoole_get_vm_status,        arginfo_swoole_get_vm_status)
@@ -141,9 +149,7 @@ const zend_function_entry swoole_functions[] = {
 };
 
 static const zend_module_dep swoole_deps[] = {
-#ifdef SW_USE_JSON
     ZEND_MOD_REQUIRED("json")
-#endif
 #ifdef SW_USE_MYSQLND
     ZEND_MOD_REQUIRED("mysqlnd")
 #endif
@@ -153,6 +159,10 @@ static const zend_module_dep swoole_deps[] = {
 #ifdef SW_USE_CURL
     ZEND_MOD_REQUIRED("curl")
 #endif
+#if defined(SW_USE_PGSQL) || defined(SW_USE_ORACLE) || defined(SW_USE_SQLITE)
+    ZEND_MOD_REQUIRED("pdo")
+#endif
+
     ZEND_MOD_END
 };
 
@@ -179,6 +189,9 @@ zend_class_entry *swoole_error_ce;
 zend_object_handlers swoole_error_handlers;
 
 #ifdef COMPILE_DL_SWOOLE
+#ifdef ZTS
+ZEND_TSRMLS_CACHE_DEFINE()
+#endif
 ZEND_GET_MODULE(swoole)
 #endif
 
@@ -190,8 +203,8 @@ PHP_INI_BEGIN()
 /**
  * enable swoole coroutine
  */
-STD_ZEND_INI_BOOLEAN("swoole.enable_coroutine", "On", PHP_INI_ALL, OnUpdateBool, enable_coroutine, zend_swoole_globals, swoole_globals)
 STD_ZEND_INI_BOOLEAN("swoole.enable_library", "On", PHP_INI_ALL, OnUpdateBool, enable_library, zend_swoole_globals, swoole_globals)
+STD_ZEND_INI_BOOLEAN("swoole.enable_fiber_mock", "Off", PHP_INI_ALL, OnUpdateBool, enable_fiber_mock, zend_swoole_globals, swoole_globals)
 /**
  * enable swoole coroutine epreemptive scheduler
  */
@@ -212,12 +225,17 @@ PHP_INI_END()
 // clang-format on
 
 static void php_swoole_init_globals(zend_swoole_globals *swoole_globals) {
-    swoole_globals->enable_coroutine = 1;
     swoole_globals->enable_library = 1;
+    swoole_globals->enable_fiber_mock = 0;
     swoole_globals->enable_preemptive_scheduler = 0;
     swoole_globals->socket_buffer_size = SW_SOCKET_BUFFER_SIZE;
     swoole_globals->display_errors = 1;
     swoole_globals->use_shortname = 1;
+    swoole_globals->in_autoload = nullptr;
+    if (strcmp("cli", sapi_module.name) == 0 || strcmp("phpdbg", sapi_module.name) == 0 ||
+        strcmp("embed", sapi_module.name) == 0 || strcmp("micro", sapi_module.name) == 0) {
+        swoole_globals->cli = 1;
+    }
 }
 
 void php_swoole_register_shutdown_function(const char *function) {
@@ -243,17 +261,19 @@ void php_swoole_set_global_option(HashTable *vht) {
 
 #ifdef SW_DEBUG
     if (php_swoole_array_get_value(vht, "debug_mode", ztmp) && zval_is_true(ztmp)) {
-        sw_logger()->set_level(0);
+        swoole_set_log_level(0);
     }
 #endif
+    // [Logger]
+    // ======================================================================
     if (php_swoole_array_get_value(vht, "trace_flags", ztmp)) {
-        SwooleG.trace_flags = (uint32_t) SW_MAX(0, zval_get_long(ztmp));
+        swoole_set_trace_flags(zval_get_long(ztmp));
     }
     if (php_swoole_array_get_value(vht, "log_file", ztmp)) {
-        sw_logger()->open(zend::String(ztmp).val());
+        swoole_set_log_file(zend::String(ztmp).val());
     }
     if (php_swoole_array_get_value(vht, "log_level", ztmp)) {
-        sw_logger()->set_level(zval_get_long(ztmp));
+        swoole_set_log_level(zval_get_long(ztmp));
     }
     if (php_swoole_array_get_value(vht, "log_date_format", ztmp)) {
         sw_logger()->set_date_format(zend::String(ztmp).val());
@@ -267,10 +287,13 @@ void php_swoole_set_global_option(HashTable *vht) {
     if (php_swoole_array_get_value(vht, "display_errors", ztmp)) {
         SWOOLE_G(display_errors) = zval_is_true(ztmp);
     }
+    // [DNS]
+    // ======================================================================
     if (php_swoole_array_get_value(vht, "dns_server", ztmp)) {
         swoole_set_dns_server(zend::String(ztmp).to_std_string());
     }
-
+    // [Socket]
+    // ======================================================================
     auto timeout_format = [](zval *v) -> double {
         double timeout = zval_get_double(v);
         if (timeout <= 0 || timeout > INT_MAX) {
@@ -279,7 +302,6 @@ void php_swoole_set_global_option(HashTable *vht) {
             return timeout;
         }
     };
-
     if (php_swoole_array_get_value(vht, "socket_dns_timeout", ztmp)) {
         Socket::default_dns_timeout = timeout_format(ztmp);
     }
@@ -295,10 +317,30 @@ void php_swoole_set_global_option(HashTable *vht) {
         Socket::default_read_timeout = timeout_format(ztmp);
     }
     if (php_swoole_array_get_value(vht, "socket_buffer_size", ztmp)) {
-        Socket::default_buffer_size = zval_get_long(ztmp);
+        Socket::default_buffer_size = php_swoole_parse_to_size(ztmp);
     }
     if (php_swoole_array_get_value(vht, "socket_timeout", ztmp)) {
         Socket::default_read_timeout = Socket::default_write_timeout = timeout_format(ztmp);
+    }
+    // [HTTP2]
+    // ======================================================================
+    if (php_swoole_array_get_value(vht, "http2_header_table_size", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTING_HEADER_TABLE_SIZE, php_swoole_parse_to_size(ztmp));
+    }
+    if (php_swoole_array_get_value(vht, "http2_enable_push", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_ENABLE_PUSH, zval_get_long(ztmp));
+    }
+    if (php_swoole_array_get_value(vht, "http2_max_concurrent_streams", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, zval_get_long(ztmp));
+    }
+    if (php_swoole_array_get_value(vht, "http2_init_window_size", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_INIT_WINDOW_SIZE, php_swoole_parse_to_size(ztmp));
+    }
+    if (php_swoole_array_get_value(vht, "http2_max_frame_size", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_FRAME_SIZE, php_swoole_parse_to_size(ztmp));
+    }
+    if (php_swoole_array_get_value(vht, "http2_max_header_list_size", ztmp)) {
+        swoole::http2::put_default_setting(SW_HTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, php_swoole_parse_to_size(ztmp));
     }
 }
 
@@ -310,8 +352,59 @@ SW_API bool php_swoole_is_enable_coroutine() {
     if (sw_server()) {
         return sw_server()->is_enable_coroutine();
     } else {
-        return SWOOLE_G(enable_coroutine);
+        return SwooleG.enable_coroutine;
     }
+}
+
+SW_API zend_long php_swoole_parse_to_size(zval *zv) {
+    if (ZVAL_IS_STRING(zv)) {
+#if PHP_VERSION_ID >= 80200
+        zend_string *errstr;
+        auto size = zend_ini_parse_quantity(Z_STR_P(zv), &errstr);
+        if (errstr) {
+            php_swoole_fatal_error(
+                E_ERROR, "failed to parse '%s' to size, Error: %s", Z_STRVAL_P(zv), ZSTR_VAL(errstr));
+            zend_string_release(errstr);
+        }
+        return size;
+#else
+        return zend_atol(Z_STRVAL_P(zv), Z_STRLEN_P(zv));
+#endif
+    } else {
+        return zval_get_long(zv);
+    }
+}
+
+SW_API zend_string *php_swoole_serialize(zval *zdata) {
+    php_serialize_data_t var_hash;
+    smart_str serialized_data = {0};
+
+    PHP_VAR_SERIALIZE_INIT(var_hash);
+    php_var_serialize(&serialized_data, zdata, &var_hash);
+    PHP_VAR_SERIALIZE_DESTROY(var_hash);
+
+    zend_string *result = nullptr;
+    if (!EG(exception)) {
+        result = zend_string_init(serialized_data.s->val, serialized_data.s->len, 1);
+    }
+    smart_str_free(&serialized_data);
+    return result;
+}
+
+SW_API bool php_swoole_unserialize(zend_string *data, zval *zv) {
+    php_unserialize_data_t var_hash;
+    const char *p = ZSTR_VAL(data);
+    size_t l = ZSTR_LEN(data);
+
+    PHP_VAR_UNSERIALIZE_INIT(var_hash);
+    zend_bool unserialized = php_var_unserialize(zv, (const uchar **) &p, (const uchar *) (p + l), &var_hash);
+    PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+    if (!unserialized) {
+        swoole_warning("unserialize() failed, Error at offset " ZEND_LONG_FMT " of %zd bytes",
+                       (zend_long) ((char *) p - ZSTR_VAL(data)),
+                       l);
+    }
+    return unserialized;
 }
 
 static void fatal_error(int code, const char *format, ...) {
@@ -321,13 +414,14 @@ static void fatal_error(int code, const char *format, ...) {
         zend_throw_exception(swoole_error_ce, swoole::std_string::vformat(format, args).c_str(), code);
     va_end(args);
 
-    zend_try {
-        zend_exception_error(exception, E_ERROR);
+    zend::print_error(exception, E_ERROR);
+
+#ifdef SW_THREAD
+    if (!tsrm_is_main_thread()) {
+        php_swoole_thread_bailout();
     }
-    zend_catch {
-        exit(255);
-    }
-    zend_end_try();
+#endif
+    swoole_exit(255);
 }
 
 static void bug_report_message_init() {
@@ -363,10 +457,7 @@ PHP_MINIT_FUNCTION(swoole) {
 #ifdef SW_HAVE_BROTLI
     SW_REGISTER_BOOL_CONSTANT("SWOOLE_HAVE_BROTLI", 1);
 #endif
-#ifdef SW_USE_HTTP2
     SW_REGISTER_BOOL_CONSTANT("SWOOLE_USE_HTTP2", 1);
-#endif
-
     SW_REGISTER_BOOL_CONSTANT("SWOOLE_USE_SHORTNAME", SWOOLE_G(use_shortname));
 
     /**
@@ -488,6 +579,11 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_OPERATION_NOT_SUPPORT", SW_ERROR_OPERATION_NOT_SUPPORT);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_PROTOCOL_ERROR", SW_ERROR_PROTOCOL_ERROR);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WRONG_OPERATION", SW_ERROR_WRONG_OPERATION);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_PHP_RUNTIME_NOTICE", SW_ERROR_PHP_RUNTIME_NOTICE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_FOR_TEST", SW_ERROR_FOR_TEST);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_NO_PAYLOAD", SW_ERROR_NO_PAYLOAD);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_UNDEFINED_BEHAVIOR", SW_ERROR_UNDEFINED_BEHAVIOR);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_NOT_THREAD_SAFETY", SW_ERROR_NOT_THREAD_SAFETY);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_FILE_NOT_EXIST", SW_ERROR_FILE_NOT_EXIST);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_FILE_TOO_LARGE", SW_ERROR_FILE_TOO_LARGE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_FILE_EMPTY", SW_ERROR_FILE_EMPTY);
@@ -498,6 +594,7 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_DNSLOOKUP_NO_SERVER", SW_ERROR_DNSLOOKUP_NO_SERVER);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_BAD_IPV6_ADDRESS", SW_ERROR_BAD_IPV6_ADDRESS);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_UNREGISTERED_SIGNAL", SW_ERROR_UNREGISTERED_SIGNAL);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_BAD_HOST_ADDR", SW_ERROR_BAD_HOST_ADDR);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_EVENT_SOCKET_REMOVED", SW_ERROR_EVENT_SOCKET_REMOVED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SESSION_CLOSED_BY_SERVER", SW_ERROR_SESSION_CLOSED_BY_SERVER);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SESSION_CLOSED_BY_CLIENT", SW_ERROR_SESSION_CLOSED_BY_CLIENT);
@@ -520,6 +617,7 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_PACKAGE_LENGTH_TOO_LARGE", SW_ERROR_PACKAGE_LENGTH_TOO_LARGE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_PACKAGE_LENGTH_NOT_FOUND", SW_ERROR_PACKAGE_LENGTH_NOT_FOUND);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_DATA_LENGTH_TOO_LARGE", SW_ERROR_DATA_LENGTH_TOO_LARGE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_PACKAGE_MALFORMED_DATA", SW_ERROR_PACKAGE_MALFORMED_DATA);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_TASK_PACKAGE_TOO_BIG", SW_ERROR_TASK_PACKAGE_TOO_BIG);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_TASK_DISPATCH_FAIL", SW_ERROR_TASK_DISPATCH_FAIL);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_TASK_TIMEOUT", SW_ERROR_TASK_TIMEOUT);
@@ -527,6 +625,7 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP2_STREAM_NO_HEADER", SW_ERROR_HTTP2_STREAM_NO_HEADER);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP2_STREAM_NOT_FOUND", SW_ERROR_HTTP2_STREAM_NOT_FOUND);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP2_STREAM_IGNORE", SW_ERROR_HTTP2_STREAM_IGNORE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP2_SEND_CONTROL_FRAME_FAILED", SW_ERROR_HTTP2_SEND_CONTROL_FRAME_FAILED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_AIO_BAD_REQUEST", SW_ERROR_AIO_BAD_REQUEST);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_AIO_CANCELED", SW_ERROR_AIO_CANCELED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_AIO_TIMEOUT", SW_ERROR_AIO_TIMEOUT);
@@ -542,11 +641,16 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_INVALID_PROTOCOL", SW_ERROR_HTTP_INVALID_PROTOCOL);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_PROXY_HANDSHAKE_FAILED", SW_ERROR_HTTP_PROXY_HANDSHAKE_FAILED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_PROXY_BAD_RESPONSE", SW_ERROR_HTTP_PROXY_BAD_RESPONSE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_CONFLICT_HEADER", SW_ERROR_HTTP_CONFLICT_HEADER);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_CONTEXT_UNAVAILABLE", SW_ERROR_HTTP_CONTEXT_UNAVAILABLE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_HTTP_COOKIE_UNAVAILABLE", SW_ERROR_HTTP_COOKIE_UNAVAILABLE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_BAD_CLIENT", SW_ERROR_WEBSOCKET_BAD_CLIENT);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_BAD_OPCODE", SW_ERROR_WEBSOCKET_BAD_OPCODE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_UNCONNECTED", SW_ERROR_WEBSOCKET_UNCONNECTED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_HANDSHAKE_FAILED", SW_ERROR_WEBSOCKET_HANDSHAKE_FAILED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_PACK_FAILED", SW_ERROR_WEBSOCKET_PACK_FAILED);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_UNPACK_FAILED", SW_ERROR_WEBSOCKET_UNPACK_FAILED);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_WEBSOCKET_INCOMPLETE_PACKET", SW_ERROR_WEBSOCKET_INCOMPLETE_PACKET);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_MUST_CREATED_BEFORE_CLIENT", SW_ERROR_SERVER_MUST_CREATED_BEFORE_CLIENT);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_TOO_MANY_SOCKET", SW_ERROR_SERVER_TOO_MANY_SOCKET);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_WORKER_TERMINATED", SW_ERROR_SERVER_WORKER_TERMINATED);
@@ -559,6 +663,10 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_INVALID_REQUEST", SW_ERROR_SERVER_INVALID_REQUEST);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_CONNECT_FAIL", SW_ERROR_SERVER_CONNECT_FAIL);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_INVALID_COMMAND", SW_ERROR_SERVER_INVALID_COMMAND);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_IS_NOT_REGULAR_FILE", SW_ERROR_SERVER_IS_NOT_REGULAR_FILE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_SEND_TO_WOKER_TIMEOUT", SW_ERROR_SERVER_SEND_TO_WOKER_TIMEOUT);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_INVALID_CALLBACK", SW_ERROR_SERVER_INVALID_CALLBACK);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_UNRELATED_THREAD", SW_ERROR_SERVER_UNRELATED_THREAD);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_WORKER_EXIT_TIMEOUT", SW_ERROR_SERVER_WORKER_EXIT_TIMEOUT);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_WORKER_ABNORMAL_PIPE_DATA", SW_ERROR_SERVER_WORKER_ABNORMAL_PIPE_DATA);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_SERVER_WORKER_UNPROCESSED_DATA", SW_ERROR_SERVER_WORKER_UNPROCESSED_DATA);
@@ -580,6 +688,7 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_CO_NOT_EXISTS", SW_ERROR_CO_NOT_EXISTS);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_CO_CANCELED", SW_ERROR_CO_CANCELED);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_CO_TIMEDOUT", SW_ERROR_CO_TIMEDOUT);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_ERROR_CO_SOCKET_CLOSE_WAIT", SW_ERROR_CO_SOCKET_CLOSE_WAIT);
 
     /**
      * trace log
@@ -614,6 +723,11 @@ PHP_MINIT_FUNCTION(swoole) {
     SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_TABLE", SW_TRACE_TABLE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CO_CURL", SW_TRACE_CO_CURL);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CARES", SW_TRACE_CARES);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_ZLIB", SW_TRACE_ZLIB);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CO_PGSQL", SW_TRACE_CO_PGSQL);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CO_ODBC", SW_TRACE_CO_ODBC);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CO_ORACLE", SW_TRACE_CO_ORACLE);
+    SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_CO_SQLITE", SW_TRACE_CO_SQLITE);
     SW_REGISTER_LONG_CONSTANT("SWOOLE_TRACE_ALL", SW_TRACE_ALL);
 
     /**
@@ -642,20 +756,27 @@ PHP_MINIT_FUNCTION(swoole) {
      */
     SW_REGISTER_LONG_CONSTANT("SWOOLE_IOV_MAX", IOV_MAX);
 
+    /**
+     * iouring
+     */
+#ifdef SW_USE_IOURING
+     SW_REGISTER_LONG_CONSTANT("SWOOLE_IOURING_DEFAULT", SW_IOURING_DEFAULT);
+     SW_REGISTER_LONG_CONSTANT("SWOOLE_IOURING_SQPOLL", SW_IOURING_SQPOLL);
+#endif
+
     // clang-format on
 
     if (SWOOLE_G(use_shortname)) {
-        SW_FUNCTION_ALIAS(CG(function_table), "swoole_coroutine_create", CG(function_table), "go");
-        SW_FUNCTION_ALIAS(CG(function_table), "swoole_coroutine_defer", CG(function_table), "defer");
+        SW_FUNCTION_ALIAS(
+            CG(function_table), "swoole_coroutine_create", CG(function_table), "go", arginfo_swoole_coroutine_create);
+        SW_FUNCTION_ALIAS(
+            CG(function_table), "swoole_coroutine_defer", CG(function_table), "defer", arginfo_swoole_coroutine_defer);
     }
 
     swoole_init();
 
     // init bug report message
     bug_report_message_init();
-    if (strcmp("cli", sapi_module.name) == 0 || strcmp("phpdbg", sapi_module.name) == 0) {
-        SWOOLE_G(cli) = 1;
-    }
 
     SW_INIT_CLASS_ENTRY_EX2(
         swoole_exception, "Swoole\\Exception", nullptr, nullptr, zend_ce_exception, zend_get_std_object_handlers());
@@ -676,30 +797,47 @@ PHP_MINIT_FUNCTION(swoole) {
     php_swoole_coroutine_minit(module_number);
     php_swoole_coroutine_system_minit(module_number);
     php_swoole_coroutine_scheduler_minit(module_number);
+    php_swoole_coroutine_lock_minit(module_number);
     php_swoole_channel_coro_minit(module_number);
     php_swoole_runtime_minit(module_number);
     // client
     php_swoole_socket_coro_minit(module_number);
     php_swoole_client_minit(module_number);
+    php_swoole_client_async_minit(module_number);
     php_swoole_client_coro_minit(module_number);
     php_swoole_http_client_coro_minit(module_number);
-    php_swoole_mysql_coro_minit(module_number);
-    php_swoole_redis_coro_minit(module_number);
-#ifdef SW_USE_HTTP2
     php_swoole_http2_client_coro_minit(module_number);
-#endif
     // server
     php_swoole_server_minit(module_number);
     php_swoole_server_port_minit(module_number);
     php_swoole_http_request_minit(module_number);
     php_swoole_http_response_minit(module_number);
+    php_swoole_http_cookie_minit(module_number);
     php_swoole_http_server_minit(module_number);
     php_swoole_http_server_coro_minit(module_number);
     php_swoole_websocket_server_minit(module_number);
     php_swoole_redis_server_minit(module_number);
     php_swoole_name_resolver_minit(module_number);
 #ifdef SW_USE_PGSQL
-    php_swoole_postgresql_coro_minit(module_number);
+    php_swoole_pgsql_minit(module_number);
+#endif
+#ifdef SW_USE_ODBC
+    php_swoole_odbc_minit(module_number);
+#endif
+#ifdef SW_USE_ORACLE
+    php_swoole_oracle_minit(module_number);
+#endif
+#ifdef SW_USE_SQLITE
+    php_swoole_sqlite_minit(module_number);
+#endif
+#ifdef SW_THREAD
+    php_swoole_thread_minit(module_number);
+    php_swoole_thread_atomic_minit(module_number);
+    php_swoole_thread_lock_minit(module_number);
+    php_swoole_thread_barrier_minit(module_number);
+    php_swoole_thread_queue_minit(module_number);
+    php_swoole_thread_map_minit(module_number);
+    php_swoole_thread_arraylist_minit(module_number);
 #endif
 
     SwooleG.fatal_error = fatal_error;
@@ -720,9 +858,23 @@ PHP_MINIT_FUNCTION(swoole) {
 /* {{{ PHP_MSHUTDOWN_FUNCTION
  */
 PHP_MSHUTDOWN_FUNCTION(swoole) {
-    swoole_clean();
     zend::known_strings_dtor();
+
     php_swoole_runtime_mshutdown();
+    php_swoole_websocket_server_mshutdown();
+#ifdef SW_USE_PGSQL
+    php_swoole_pgsql_mshutdown();
+#endif
+
+#ifdef SW_USE_ORACLE
+    php_swoole_oracle_mshutdown();
+#endif
+
+#ifdef SW_USE_SQLITE
+    php_swoole_sqlite_mshutdown();
+#endif
+
+    swoole_clean();
 
     return SUCCESS;
 }
@@ -760,6 +912,9 @@ PHP_MINFO_FUNCTION(swoole) {
 #ifdef HAVE_KQUEUE
     php_info_print_table_row(2, "kqueue", "enabled");
 #endif
+#ifdef SW_THREAD
+    php_info_print_table_row(2, "thread", "enabled");
+#endif
 #ifdef HAVE_SIGNALFD
     php_info_print_table_row(2, "signalfd", "enabled");
 #endif
@@ -788,17 +943,12 @@ PHP_MINFO_FUNCTION(swoole) {
     php_info_print_table_row(2, "dtls", "enabled");
 #endif
 #endif
-#ifdef SW_USE_HTTP2
     php_info_print_table_row(2, "http2", "enabled");
-#endif
-#ifdef SW_USE_JSON
     php_info_print_table_row(2, "json", "enabled");
-#endif
 #ifdef SW_USE_CURL
     php_info_print_table_row(2, "curl-native", "enabled");
-#endif
-#ifdef HAVE_PCRE
-    php_info_print_table_row(2, "pcre", "enabled");
+    curl_version_info_data *d = curl_version_info(CURLVERSION_NOW);
+    php_info_print_table_row(2, "curl-version", d->version);
 #endif
 #ifdef SW_USE_CARES
     php_info_print_table_row(2, "c-ares", ares_version(nullptr));
@@ -813,6 +963,13 @@ PHP_MINFO_FUNCTION(swoole) {
 #ifdef SW_HAVE_BROTLI
     snprintf(buf, sizeof(buf), "E%u/D%u", BrotliEncoderVersion(), BrotliDecoderVersion());
     php_info_print_table_row(2, "brotli", buf);
+#endif
+#ifdef SW_HAVE_ZSTD
+#ifdef ZSTD_VERSION_NUMBER
+    php_info_print_table_row(2, "zstd", ZSTD_VERSION_STRING);
+#else
+    php_info_print_table_row(2, "zstd", "enabled");
+#endif
 #endif
 #ifdef HAVE_MUTEX_TIMEDLOCK
     php_info_print_table_row(2, "mutex_timedlock", "enabled");
@@ -832,9 +989,20 @@ PHP_MINFO_FUNCTION(swoole) {
 #ifdef SW_USE_TCMALLOC
     php_info_print_table_row(2, "tcmalloc", "enabled");
 #endif
-    php_info_print_table_row(2, "async_redis", "enabled");
 #ifdef SW_USE_PGSQL
-    php_info_print_table_row(2, "coroutine_postgresql", "enabled");
+    php_info_print_table_row(2, "coroutine_pgsql", "enabled");
+#endif
+#ifdef SW_USE_ODBC
+    php_info_print_table_row(2, "coroutine_odbc", "enabled");
+#endif
+#ifdef SW_USE_ORACLE
+    php_info_print_table_row(2, "coroutine_oracle", "enabled");
+#endif
+#ifdef SW_USE_SQLITE
+    php_info_print_table_row(2, "coroutine_sqlite", "enabled");
+#endif
+#ifdef SW_USE_IOURING
+    php_info_print_table_row(2, "io_uring", "enabled");
 #endif
     php_info_print_table_end();
 
@@ -908,13 +1076,55 @@ const swoole::Allocator *sw_zend_string_allocator() {
     return &zend_string_allocator;
 }
 
+void sw_php_exit(int status) {
+    EG(exit_status) = status;
+#ifdef SW_THREAD
+    php_swoole_thread_bailout();
+#else
+    zend_bailout();
+#endif
+}
+
+bool sw_zval_is_serializable(zval *struc) {
+again:
+    switch (Z_TYPE_P(struc)) {
+    case IS_OBJECT: {
+        if (Z_OBJCE_P(struc)->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+            return false;
+        }
+        break;
+    }
+    case IS_ARRAY: {
+        zval *elem;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(struc), elem) {
+            if (!sw_zval_is_serializable(elem)) {
+                return false;
+            }
+        }
+        ZEND_HASH_FOREACH_END();
+        break;
+    }
+    case IS_REFERENCE:
+        struc = Z_REFVAL_P(struc);
+        goto again;
+    default:
+        break;
+    }
+    return true;
+}
+
+static void sw_after_fork(void *args) {
+#ifdef ZEND_MAX_EXECUTION_TIMERS
+    zend_max_execution_timer_init();
+#endif
+}
+
 PHP_RINIT_FUNCTION(swoole) {
     if (!SWOOLE_G(cli)) {
         return SUCCESS;
     }
 
     SWOOLE_G(req_status) = PHP_SWOOLE_RINIT_BEGIN;
-    SwooleG.running = 1;
 
     php_swoole_register_shutdown_function("swoole_internal_call_user_shutdown_begin");
 
@@ -924,7 +1134,24 @@ PHP_RINIT_FUNCTION(swoole) {
         && !(CG(compiler_options) & ZEND_COMPILE_PRELOAD)
 #endif
     ) {
+        // https://github.com/swoole/swoole-src/issues/5182
+        /**
+         * xdebug will hook zend_execute_ex to xdebug_execute_ex.
+         * This would cause php_swoole_load_library function not to execute correctly, so it must be replaced
+         * with the execute_ex function.
+         */
+        void (*old_zend_execute_ex)(zend_execute_data * execute_data) = nullptr;
+        if (UNEXPECTED(zend_execute_ex != execute_ex)) {
+            old_zend_execute_ex = zend_execute_ex;
+            zend_execute_ex = execute_ex;
+        }
+
         php_swoole_load_library();
+
+        if (UNEXPECTED(old_zend_execute_ex)) {
+            zend_execute_ex = old_zend_execute_ex;
+            old_zend_execute_ex = nullptr;
+        }
     }
 
 #ifdef ZEND_SIGNALS
@@ -932,8 +1159,18 @@ PHP_RINIT_FUNCTION(swoole) {
     SIGG(check) = 0;
 #endif
 
+    swoole_add_hook(SW_GLOBAL_HOOK_AFTER_FORK, sw_after_fork, 0);
+
+    php_swoole_http_server_rinit();
+    php_swoole_websocket_server_rinit();
     php_swoole_coroutine_rinit();
     php_swoole_runtime_rinit();
+#ifdef SW_USE_ORACLE
+    php_swoole_oracle_rinit();
+#endif
+#ifdef SW_THREAD
+    php_swoole_thread_rinit();
+#endif
 
     SWOOLE_G(req_status) = PHP_SWOOLE_RINIT_END;
 
@@ -949,18 +1186,21 @@ PHP_RSHUTDOWN_FUNCTION(swoole) {
 
     rshutdown_callbacks.execute();
 
-    swoole_event_free();
-
     php_swoole_server_rshutdown();
+    php_swoole_http_server_rshutdown();
+    php_swoole_websocket_server_rshutdown();
     php_swoole_async_coro_rshutdown();
     php_swoole_redis_server_rshutdown();
     php_swoole_coroutine_rshutdown();
     php_swoole_coroutine_scheduler_rshutdown();
     php_swoole_runtime_rshutdown();
+    php_swoole_process_rshutdown();
+#ifdef SW_THREAD
+    php_swoole_thread_rshutdown();
+#endif
 
-    php_swoole_process_clean();
+    swoole_event_free();
 
-    SwooleG.running = 0;
     SWOOLE_G(req_status) = PHP_SWOOLE_RSHUTDOWN_END;
 
 #ifdef PHP_STREAM_FLAG_NO_CLOSE
@@ -972,8 +1212,7 @@ PHP_RSHUTDOWN_FUNCTION(swoole) {
         if (!zstream) {
             return;
         }
-        stream =
-            (php_stream *) zend_fetch_resource2_ex((zstream), "stream", php_file_le_stream(), php_file_le_pstream());
+        stream = (php_stream *) zend_fetch_resource2_ex((zstream), NULL, php_file_le_stream(), php_file_le_pstream());
         if (!stream) {
             return;
         }
@@ -1297,17 +1536,19 @@ static PHP_FUNCTION(swoole_substr_unserialize) {
     }
     if (offset < 0) {
         offset = buf_len + offset;
+        if (offset < 0) {
+            RETURN_FALSE;
+        }
     }
     if ((zend_long) buf_len <= offset) {
         RETURN_FALSE;
     }
-    if (length <= 0) {
+    if (length <= 0 || length > (zend_long) (buf_len - offset)) {
         length = buf_len - offset;
     }
     zend::unserialize(return_value, buf + offset, length, options ? Z_ARRVAL_P(options) : NULL);
 }
 
-#ifdef SW_USE_JSON
 static PHP_FUNCTION(swoole_substr_json_decode) {
     zend_long offset, length = 0;
     char *str;
@@ -1328,15 +1569,21 @@ static PHP_FUNCTION(swoole_substr_json_decode) {
     ZEND_PARSE_PARAMETERS_END();
 
     if (str_len == 0) {
-        RETURN_FALSE;
+        php_error_docref(nullptr, E_WARNING, "Non-empty string required");
+        RETURN_NULL();
     }
     if (offset < 0) {
         offset = str_len + offset;
+        if (offset < 0) {
+            php_error_docref(nullptr, E_WARNING, "Offset must be not less than the negative length of the string");
+            RETURN_NULL();
+        }
     }
     if ((zend_long) str_len <= offset) {
-        RETURN_FALSE;
+        php_error_docref(nullptr, E_WARNING, "Offset must be less than the length of the string");
+        RETURN_NULL();
     }
-    if (length <= 0) {
+    if (length <= 0 || length > (zend_long) (str_len - offset)) {
         length = str_len - offset;
     }
     /* For BC reasons, the bool $assoc overrides the long $options bit for PHP_JSON_OBJECT_AS_ARRAY */
@@ -1349,4 +1596,40 @@ static PHP_FUNCTION(swoole_substr_json_decode) {
     }
     zend::json_decode(return_value, str + offset, length, options, depth);
 }
-#endif
+
+/**
+ * The implicit functions are intended solely for internal testing and will not be documented.
+ * These functions are unsafe, do not use if you are not an internal developer.
+ */
+static PHP_FUNCTION(swoole_implicit_fn) {
+    char *fn;
+    size_t l_fn;
+    zval *zargs = nullptr;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+    Z_PARAM_STRING(fn, l_fn)
+    Z_PARAM_OPTIONAL
+    Z_PARAM_ZVAL(zargs)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (SW_STRCASEEQ(fn, l_fn, "fatal_error")) {
+        swoole_fatal_error(SW_ERROR_FOR_TEST, "test");
+        php_printf("never be executed here\n");
+    } else if (SW_STRCASEEQ(fn, l_fn, "bailout")) {
+        sw_php_exit(zargs ? zval_get_long(zargs) : 95);
+    } else if (SW_STRCASEEQ(fn, l_fn, "abort")) {
+        abort();
+    } else if (SW_STRCASEEQ(fn, l_fn, "refcount")) {
+        RETURN_LONG(zval_refcount_p(zargs));
+    } else if (SW_STRCASEEQ(fn, l_fn, "func_handler")) {
+        auto fn = zval_get_string(zargs);
+        zend_function *zf = (zend_function *) zend_hash_find_ptr(EG(function_table), fn);
+        zend_string_release(fn);
+        if (zf == nullptr) {
+            RETURN_FALSE;
+        }
+        printf("zif_handler=%p\n", zf->internal_function.handler);
+    } else {
+        zend_throw_exception_ex(swoole_exception_ce, SW_ERROR_INVALID_PARAMS, "unknown fn '%s'", fn);
+    }
+}

@@ -4,6 +4,31 @@
 using namespace std;
 using swoole::String;
 
+TEST(string, ltrim) {
+    char buf[1024];
+    char *ptr_buf;
+    strcpy(buf, "  hello world");
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("hello world", ptr_buf), 0);
+    ASSERT_NE(strcmp("  hello world", ptr_buf), 0);
+
+    strcpy(buf, "  ");
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strlen(ptr_buf), 0);
+
+    memcpy(buf, "  a\0b\0", 6);
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("a", ptr_buf), 0);
+
+    buf[0] = '\0';
+    ptr_buf = buf;
+    swoole::ltrim(&ptr_buf, strlen(buf));
+    ASSERT_EQ(strcmp("", ptr_buf), 0);
+}
+
 TEST(string, rtrim) {
     char buf[1024];
     strcpy(buf, "hello world  ");
@@ -14,6 +39,10 @@ TEST(string, rtrim) {
     strcpy(buf, "  ");
     swoole::rtrim(buf, strlen(buf));
     ASSERT_EQ(strlen(buf), 0);
+
+    buf[0] = '\0';
+    swoole::rtrim(buf, strlen(buf));
+    ASSERT_EQ(strcmp("", buf), 0);
 }
 
 TEST(string, strnpos) {
@@ -39,17 +68,19 @@ TEST(string, strnstr) {
     {
         string haystack = "hello world";
         string needle = " ";
-        const char *pos;
-
-        pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
         ASSERT_EQ(haystack.c_str() + 5, pos);
     }
     {
         string haystack = "hello world";
         string needle = "*";
-        const char *pos;
-
-        pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
+        ASSERT_EQ(NULL, pos);
+    }
+    {
+        string haystack = "hello world\r\n";
+        string needle = "\r\n\r\n";
+        const char *pos = swoole_strnstr(haystack.c_str(), haystack.length(), needle.c_str(), needle.length());
         ASSERT_EQ(NULL, pos);
     }
 }
@@ -231,10 +262,10 @@ TEST(string, ends_with) {
 
 TEST(string, append_number) {
     string data = "hello";
-    auto str = swoole::make_string(data.length());
+    auto str = swoole::make_string(data.length() + 32);
     str->append(data.c_str(), data.length());
     str->append(123);
-    str->str[str->length] = '\0';
+    str->set_null_terminated();
     EXPECT_STREQ(str->str, data.append("123").c_str());
 
     str->print(true);

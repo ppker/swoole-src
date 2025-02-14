@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -307,4 +307,26 @@ TEST(table, get_value) {
 
     row->get_value(column_id, &lval);
     ASSERT_EQ(lval, 0);
+}
+
+TEST(table, lock) {
+    table_t table(test_table_size);
+    create_table(table);
+    auto ptr = table.ptr();
+
+    std::string key("php");
+    TableRow *_rowlock = nullptr;
+
+    for (int i = 0; i <= 3; i++) {
+        std::thread t([&]() {
+            TableRow *row = ptr->get(key.c_str(), key.length(), &_rowlock);
+            TableColumn *column_name = ptr->get_column("name");
+            char *str = nullptr;
+            TableStringLength len = 0;
+            row->get_value(column_name, &str, &len);
+            ASSERT_STREQ(str, "php");
+        });
+        t.join();
+    }
+    _rowlock->unlock();
 }

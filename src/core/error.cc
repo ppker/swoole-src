@@ -31,7 +31,7 @@ const char *swoole_strerror(int code) {
         return strerror(code);
     }
     /* swstrerror {{{*/
-    switch(code) {
+    switch (code) {
     case SW_ERROR_MALLOC_FAIL:
         return "Malloc fail";
     case SW_ERROR_SYSTEM_CALL_FAIL:
@@ -50,6 +50,16 @@ const char *swoole_strerror(int code) {
         return "Protocol error";
     case SW_ERROR_WRONG_OPERATION:
         return "Wrong operation";
+    case SW_ERROR_PHP_RUNTIME_NOTICE:
+        return "PHP runtime notice";
+    case SW_ERROR_FOR_TEST:
+        return "For test";
+    case SW_ERROR_NO_PAYLOAD:
+        return "No payload";
+    case SW_ERROR_UNDEFINED_BEHAVIOR:
+        return "Undefined behavior";
+    case SW_ERROR_NOT_THREAD_SAFETY:
+        return "Not thread safety";
     case SW_ERROR_FILE_NOT_EXIST:
         return "File not exist";
     case SW_ERROR_FILE_TOO_LARGE:
@@ -70,6 +80,8 @@ const char *swoole_strerror(int code) {
         return "Bad ipv6 address";
     case SW_ERROR_UNREGISTERED_SIGNAL:
         return "Unregistered signal";
+    case SW_ERROR_BAD_HOST_ADDR:
+        return "Bad host addr";
     case SW_ERROR_EVENT_SOCKET_REMOVED:
         return "Event socket removed";
     case SW_ERROR_SESSION_CLOSED_BY_SERVER:
@@ -114,6 +126,8 @@ const char *swoole_strerror(int code) {
         return "Package length not found";
     case SW_ERROR_DATA_LENGTH_TOO_LARGE:
         return "Data length too large";
+    case SW_ERROR_PACKAGE_MALFORMED_DATA:
+        return "Package malformed data";
     case SW_ERROR_TASK_PACKAGE_TOO_BIG:
         return "Task package too big";
     case SW_ERROR_TASK_DISPATCH_FAIL:
@@ -128,6 +142,8 @@ const char *swoole_strerror(int code) {
         return "Http2 stream not found";
     case SW_ERROR_HTTP2_STREAM_IGNORE:
         return "Http2 stream ignore";
+    case SW_ERROR_HTTP2_SEND_CONTROL_FRAME_FAILED:
+        return "Http2 send control frame failed";
     case SW_ERROR_AIO_BAD_REQUEST:
         return "Aio bad request";
     case SW_ERROR_AIO_CANCELED:
@@ -158,6 +174,12 @@ const char *swoole_strerror(int code) {
         return "Http proxy handshake failed";
     case SW_ERROR_HTTP_PROXY_BAD_RESPONSE:
         return "Http proxy bad response";
+    case SW_ERROR_HTTP_CONFLICT_HEADER:
+        return "Http conflict header";
+    case SW_ERROR_HTTP_CONTEXT_UNAVAILABLE:
+        return "Http context unavailable";
+    case SW_ERROR_HTTP_COOKIE_UNAVAILABLE:
+        return "Http cookie unavailable";
     case SW_ERROR_WEBSOCKET_BAD_CLIENT:
         return "Websocket bad client";
     case SW_ERROR_WEBSOCKET_BAD_OPCODE:
@@ -168,6 +190,10 @@ const char *swoole_strerror(int code) {
         return "Websocket handshake failed";
     case SW_ERROR_WEBSOCKET_PACK_FAILED:
         return "Websocket pack failed";
+    case SW_ERROR_WEBSOCKET_UNPACK_FAILED:
+        return "Websocket unpack failed";
+    case SW_ERROR_WEBSOCKET_INCOMPLETE_PACKET:
+        return "Websocket incomplete packet";
     case SW_ERROR_SERVER_MUST_CREATED_BEFORE_CLIENT:
         return "Server must created before client";
     case SW_ERROR_SERVER_TOO_MANY_SOCKET:
@@ -192,6 +218,14 @@ const char *swoole_strerror(int code) {
         return "Server connect fail";
     case SW_ERROR_SERVER_INVALID_COMMAND:
         return "Server invalid command";
+    case SW_ERROR_SERVER_IS_NOT_REGULAR_FILE:
+        return "Server is not regular file";
+    case SW_ERROR_SERVER_SEND_TO_WOKER_TIMEOUT:
+        return "Server send to woker timeout";
+    case SW_ERROR_SERVER_INVALID_CALLBACK:
+        return "Server invalid callback";
+    case SW_ERROR_SERVER_UNRELATED_THREAD:
+        return "Server unrelated thread";
     case SW_ERROR_SERVER_WORKER_EXIT_TIMEOUT:
         return "Server worker exit timeout";
     case SW_ERROR_SERVER_WORKER_ABNORMAL_PIPE_DATA:
@@ -234,6 +268,8 @@ const char *swoole_strerror(int code) {
         return "Coroutine canceled";
     case SW_ERROR_CO_TIMEDOUT:
         return "Coroutine timedout";
+    case SW_ERROR_CO_SOCKET_CLOSE_WAIT:
+        return "Coroutine socket close wait";
     default:
         static char buffer[32];
 #ifndef __MACH__
@@ -256,4 +292,12 @@ void swoole_ignore_error(int code) {
 
 bool swoole_is_ignored_error(int code) {
     return ignored_errors.find(code) != ignored_errors.end();
+}
+
+void swoole_clear_last_error_msg(void) {
+    sw_error[0] = '\0';
+}
+
+const char *swoole_get_last_error_msg(void) {
+    return sw_error;
 }

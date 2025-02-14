@@ -31,6 +31,9 @@
 #include <sys/event.h>
 #endif
 #endif
+#ifdef __NetBSD__
+#include <sys/param.h>
+#endif
 
 using swoole::Event;
 using swoole::Reactor;
@@ -99,6 +102,11 @@ SignalHandler swoole_signal_set(int signo, SignalHandler func, int restart, int 
         func = SIG_DFL;
     }
 
+    if (func == SIG_IGN || func == SIG_DFL) {
+        signals[signo].handler = nullptr;
+        signals[signo].activated = false;
+    }
+
     struct sigaction act {
     }, oact{};
     act.sa_handler = func;
@@ -112,6 +120,10 @@ SignalHandler swoole_signal_set(int signo, SignalHandler func, int restart, int 
         return nullptr;
     }
     return oact.sa_handler;
+}
+
+SW_API bool swoole_signal_isset(int signo) {
+    return signals[signo].handler && signals[signo].activated;
 }
 
 /**
@@ -146,7 +158,7 @@ static void swoole_signal_async_handler(int signo) {
         sw_reactor()->singal_no = signo;
     } else {
         // discard signal
-        if (_lock) {
+        if (_lock || !SwooleG.init) {
             return;
         }
         _lock = 1;
@@ -298,6 +310,7 @@ static void swoole_signalfd_clear() {
             signal_socket->free();
             signal_socket = nullptr;
         }
+        sw_memset_zero(&signals, sizeof(signals));
         sw_memset_zero(&signalfd_mask, sizeof(signalfd_mask));
     }
     SwooleG.signal_fd = 0;
@@ -355,7 +368,7 @@ static SignalHandler swoole_signal_kqueue_set(int signo, SignalHandler handler) 
         signals[signo].handler = handler;
         signals[signo].signo = signo;
         signals[signo].activated = true;
-#ifndef __NetBSD__
+#if !defined(__NetBSD__) || (defined(__NetBSD__) && __NetBSD_Version__ >= 1000000000)
         auto sigptr = &signals[signo];
 #else
         auto sigptr = reinterpret_cast<intptr_t>(&signals[signo]);

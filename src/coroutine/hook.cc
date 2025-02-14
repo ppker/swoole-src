@@ -26,21 +26,30 @@
 
 #include "swoole_coroutine_socket.h"
 #include "swoole_coroutine_system.h"
+#include "swoole_iouring.h"
 
 using swoole::AsyncEvent;
 using swoole::Coroutine;
 using swoole::async::dispatch;
+using swoole::coroutine::async;
+using swoole::coroutine::PollSocket;
 using swoole::coroutine::Socket;
 using swoole::coroutine::System;
+using swoole::coroutine::translate_events_from_poll;
+using swoole::coroutine::translate_events_to_poll;
 
-static std::unordered_map<int, Socket *> socket_map;
+#ifdef SW_USE_IOURING
+using swoole::Iouring;
+#endif
+
+static std::unordered_map<int, std::shared_ptr<Socket>> socket_map;
 static std::mutex socket_map_lock;
 
 static sw_inline bool is_no_coro() {
     return SwooleTG.reactor == nullptr || !Coroutine::get_current();
 }
 
-static sw_inline Socket *get_socket(int sockfd) {
+static sw_inline std::shared_ptr<Socket> get_socket(int sockfd) {
     std::unique_lock<std::mutex> _lock(socket_map_lock);
     auto socket_iterator = socket_map.find(sockfd);
     if (socket_iterator == socket_map.end()) {
@@ -49,14 +58,14 @@ static sw_inline Socket *get_socket(int sockfd) {
     return socket_iterator->second;
 }
 
-static sw_inline Socket *get_socket_ex(int sockfd) {
+static sw_inline std::shared_ptr<Socket> get_socket_ex(int sockfd) {
     if (sw_unlikely(is_no_coro())) {
         return nullptr;
     }
     return get_socket(sockfd);
 }
 
-Socket *swoole_coroutine_get_socket_object(int sockfd) {
+std::shared_ptr<Socket> swoole_coroutine_get_socket_object(int sockfd) {
     return get_socket(sockfd);
 }
 
@@ -66,10 +75,10 @@ int swoole_coroutine_socket(int domain, int type, int protocol) {
     if (sw_unlikely(is_no_coro())) {
         return ::socket(domain, type, protocol);
     }
-    Socket *socket = new Socket(domain, type, protocol);
+    auto socket = std::make_shared<Socket>(domain, type, protocol);
     int fd = socket->get_fd();
     if (sw_unlikely(fd < 0)) {
-        delete socket;
+        return -1;
     } else {
         std::unique_lock<std::mutex> _lock(socket_map_lock);
         socket_map[fd] = socket;
@@ -78,32 +87,32 @@ int swoole_coroutine_socket(int domain, int type, int protocol) {
 }
 
 ssize_t swoole_coroutine_send(int sockfd, const void *buf, size_t len, int flags) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         return ::send(sockfd, buf, len, flags);
     }
     return socket->send(buf, len);
 }
 
 ssize_t swoole_coroutine_sendmsg(int sockfd, const struct msghdr *msg, int flags) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         return ::sendmsg(sockfd, msg, flags);
     }
     return socket->sendmsg(msg, flags);
 }
 
 ssize_t swoole_coroutine_recvmsg(int sockfd, struct msghdr *msg, int flags) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         return ::recvmsg(sockfd, msg, flags);
     }
     return socket->recvmsg(msg, flags);
 }
 
 ssize_t swoole_coroutine_recv(int sockfd, void *buf, size_t len, int flags) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         return ::recv(sockfd, buf, len, flags);
     }
     if (flags & MSG_PEEK) {
@@ -114,30 +123,34 @@ ssize_t swoole_coroutine_recv(int sockfd, void *buf, size_t len, int flags) {
 }
 
 int swoole_coroutine_close(int sockfd) {
-    Socket *socket = get_socket(sockfd);
-    if (socket == NULL) {
+    auto socket = get_socket(sockfd);
+    if (socket == nullptr) {
         return ::close(sockfd);
     }
     if (socket->close()) {
-        delete socket;
         std::unique_lock<std::mutex> _lock(socket_map_lock);
         socket_map.erase(sockfd);
+        return 0;
     }
-    return 0;
+    return -1;
 }
 
 int swoole_coroutine_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         return ::connect(sockfd, addr, addrlen);
     }
     return socket->connect(addr, addrlen) ? 0 : -1;
 }
 
-#if 1
-int swoole_coroutine_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-    Socket *socket;
-    if (sw_unlikely(nfds != 1 || timeout == 0 || (socket = get_socket_ex(fds[0].fd)) == NULL)) {
+int swoole_coroutine_poll_fake(struct pollfd *fds, nfds_t nfds, int timeout) {
+    if (nfds != 1) {
+        swoole_set_last_error(SW_ERROR_INVALID_PARAMS);
+        swoole_warning("fake poll() implementation, only supports one socket");
+        return -1;
+    }
+    auto socket = get_socket_ex(fds[0].fd);
+    if (sw_unlikely(timeout == 0 || socket == nullptr)) {
         return poll(fds, nfds, timeout);
     }
     socket->set_timeout((double) timeout / 1000);
@@ -149,26 +162,26 @@ int swoole_coroutine_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
     }
     return 1;
 }
-#else
+
 int swoole_coroutine_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
-    if (sw_unlikely(is_no_coro() || nfds != 1 || timeout == 0)) {
+    if (sw_unlikely(is_no_coro() || timeout == 0)) {
         return poll(fds, nfds, timeout);
     }
 
-    std::unordered_map<int, swoole::socket_poll_fd> _fds;
-    for (int i = 0; i < nfds; i++) {
-        _fds.emplace(std::make_pair(fds[i].fd, swoole::socket_poll_fd(fds[i].events, &fds[i])));
+    std::unordered_map<int, PollSocket> _fds;
+    for (nfds_t i = 0; i < nfds; i++) {
+        _fds.emplace(std::make_pair(fds[i].fd, PollSocket(translate_events_from_poll(fds[i].events), &fds[i])));
     }
 
     if (!System::socket_poll(_fds, (double) timeout / 1000)) {
         return -1;
     }
 
-    int retval;
+    int retval = 0;
     for (auto &i : _fds) {
         int revents = i.second.revents;
         struct pollfd *_fd = (struct pollfd *) i.second.ptr;
-        _fd->revents = revents;
+        _fd->revents = translate_events_to_poll(revents);
         if (revents > 0) {
             retval++;
         }
@@ -176,7 +189,6 @@ int swoole_coroutine_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
 
     return retval;
 }
-#endif
 
 int swoole_coroutine_open(const char *pathname, int flags, mode_t mode) {
     if (sw_unlikely(is_no_coro())) {
@@ -184,7 +196,17 @@ int swoole_coroutine_open(const char *pathname, int flags, mode_t mode) {
     }
 
     int ret = -1;
-    swoole::coroutine::async([&]() { ret = open(pathname, flags, mode); });
+    async([&]() { ret = open(pathname, flags, mode); });
+    return ret;
+}
+
+int swoole_coroutine_close_file(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return close(fd);
+    }
+
+    int ret = -1;
+    async([&]() { ret = close(fd); });
     return ret;
 }
 
@@ -192,14 +214,28 @@ int swoole_coroutine_socket_create(int fd) {
     if (sw_unlikely(is_no_coro())) {
         return -1;
     }
-    Socket *socket = new Socket(fd, SW_SOCK_RAW);
+    auto socket = std::make_shared<Socket>(fd, SW_SOCK_RAW);
     int _fd = socket->get_fd();
     if (sw_unlikely(_fd < 0)) {
-        delete socket;
-    } else {
-        std::unique_lock<std::mutex> _lock(socket_map_lock);
-        socket_map[fd] = socket;
+        return -1;
     }
+    socket->get_socket()->set_nonblock();
+    std::unique_lock<std::mutex> _lock(socket_map_lock);
+    socket_map[fd] = socket;
+    return 0;
+}
+
+int swoole_coroutine_socket_unwrap(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return -1;
+    }
+    auto socket = get_socket(fd);
+    if (socket == nullptr) {
+        return -1;
+    }
+    std::unique_lock<std::mutex> _lock(socket_map_lock);
+    socket->move_fd();
+    socket_map.erase(fd);
     return 0;
 }
 
@@ -212,13 +248,13 @@ ssize_t swoole_coroutine_read(int sockfd, void *buf, size_t count) {
         return read(sockfd, buf, count);
     }
 
-    Socket *socket = get_socket(sockfd);
-    if (socket) {
+    auto socket = get_socket(sockfd);
+    if (socket != nullptr) {
         return socket->read(buf, count);
     }
 
     ssize_t ret = -1;
-    swoole::coroutine::async([&]() { ret = read(sockfd, buf, count); });
+    async([&]() { ret = read(sockfd, buf, count); });
     return ret;
 }
 
@@ -227,13 +263,13 @@ ssize_t swoole_coroutine_write(int sockfd, const void *buf, size_t count) {
         return write(sockfd, buf, count);
     }
 
-    Socket *socket = get_socket(sockfd);
-    if (socket) {
+    auto socket = get_socket(sockfd);
+    if (socket != nullptr) {
         return socket->write(buf, count);
     }
 
     ssize_t ret = -1;
-    swoole::coroutine::async([&]() { ret = write(sockfd, buf, count); });
+    async([&]() { ret = write(sockfd, buf, count); });
     return ret;
 }
 
@@ -243,7 +279,7 @@ off_t swoole_coroutine_lseek(int fd, off_t offset, int whence) {
     }
 
     off_t retval = -1;
-    swoole::coroutine::async([&]() { retval = lseek(fd, offset, whence); });
+    async([&]() { retval = lseek(fd, offset, whence); });
     return retval;
 }
 
@@ -253,7 +289,7 @@ int swoole_coroutine_fstat(int fd, struct stat *statbuf) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = fstat(fd, statbuf); });
+    async([&]() { retval = fstat(fd, statbuf); });
     return retval;
 }
 
@@ -263,7 +299,7 @@ int swoole_coroutine_readlink(const char *pathname, char *buf, size_t len) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = readlink(pathname, buf, len); });
+    async([&]() { retval = readlink(pathname, buf, len); });
     return retval;
 }
 
@@ -273,7 +309,7 @@ int swoole_coroutine_unlink(const char *pathname) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = unlink(pathname); });
+    async([&]() { retval = unlink(pathname); });
     return retval;
 }
 
@@ -283,7 +319,27 @@ int swoole_coroutine_statvfs(const char *path, struct statvfs *buf) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = statvfs(path, buf); });
+    async([&]() { retval = statvfs(path, buf); });
+    return retval;
+}
+
+int swoole_coroutine_stat(const char *path, struct stat *statbuf) {
+    if (sw_unlikely(is_no_coro())) {
+        return stat(path, statbuf);
+    }
+
+    int retval = -1;
+    async([&]() { retval = stat(path, statbuf); });
+    return retval;
+}
+
+int swoole_coroutine_lstat(const char *path, struct stat *statbuf) {
+    if (sw_unlikely(is_no_coro())) {
+        return lstat(path, statbuf);
+    }
+
+    int retval = -1;
+    async([&]() { retval = lstat(path, statbuf); });
     return retval;
 }
 
@@ -293,7 +349,7 @@ int swoole_coroutine_mkdir(const char *pathname, mode_t mode) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = mkdir(pathname, mode); });
+    async([&]() { retval = mkdir(pathname, mode); });
     return retval;
 }
 
@@ -303,7 +359,7 @@ int swoole_coroutine_rmdir(const char *pathname) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = rmdir(pathname); });
+    async([&]() { retval = rmdir(pathname); });
     return retval;
 }
 
@@ -313,7 +369,7 @@ int swoole_coroutine_rename(const char *oldpath, const char *newpath) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = rename(oldpath, newpath); });
+    async([&]() { retval = rename(oldpath, newpath); });
     return retval;
 }
 
@@ -323,7 +379,7 @@ int swoole_coroutine_access(const char *pathname, int mode) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = access(pathname, mode); });
+    async([&]() { retval = access(pathname, mode); });
     return retval;
 }
 
@@ -333,7 +389,7 @@ FILE *swoole_coroutine_fopen(const char *pathname, const char *mode) {
     }
 
     FILE *retval = nullptr;
-    swoole::coroutine::async([&]() { retval = fopen(pathname, mode); });
+    async([&]() { retval = fopen(pathname, mode); });
     return retval;
 }
 
@@ -343,7 +399,7 @@ FILE *swoole_coroutine_fdopen(int fd, const char *mode) {
     }
 
     FILE *retval = nullptr;
-    swoole::coroutine::async([&]() { retval = fdopen(fd, mode); });
+    async([&]() { retval = fdopen(fd, mode); });
     return retval;
 }
 
@@ -353,7 +409,7 @@ FILE *swoole_coroutine_freopen(const char *pathname, const char *mode, FILE *str
     }
 
     FILE *retval = nullptr;
-    swoole::coroutine::async([&]() { retval = freopen(pathname, mode, stream); });
+    async([&]() { retval = freopen(pathname, mode, stream); });
     return retval;
 }
 
@@ -363,7 +419,7 @@ size_t swoole_coroutine_fread(void *ptr, size_t size, size_t nmemb, FILE *stream
     }
 
     size_t retval = 0;
-    swoole::coroutine::async([&]() { retval = fread(ptr, size, nmemb, stream); });
+    async([&]() { retval = fread(ptr, size, nmemb, stream); });
     return retval;
 }
 
@@ -373,7 +429,7 @@ size_t swoole_coroutine_fwrite(const void *ptr, size_t size, size_t nmemb, FILE 
     }
 
     size_t retval = 0;
-    swoole::coroutine::async([&]() { retval = fwrite(ptr, size, nmemb, stream); });
+    async([&]() { retval = fwrite(ptr, size, nmemb, stream); });
     return retval;
 }
 
@@ -383,7 +439,7 @@ char *swoole_coroutine_fgets(char *s, int size, FILE *stream) {
     }
 
     char *retval = nullptr;
-    swoole::coroutine::async([&]() { retval = fgets(s, size, stream); });
+    async([&]() { retval = fgets(s, size, stream); });
     return retval;
 }
 
@@ -393,7 +449,7 @@ int swoole_coroutine_fputs(const char *s, FILE *stream) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = fputs(s, stream); });
+    async([&]() { retval = fputs(s, stream); });
     return retval;
 }
 
@@ -403,7 +459,7 @@ int swoole_coroutine_feof(FILE *stream) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = feof(stream); });
+    async([&]() { retval = feof(stream); });
     return retval;
 }
 
@@ -413,7 +469,7 @@ int swoole_coroutine_fclose(FILE *stream) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = fclose(stream); });
+    async([&]() { retval = fclose(stream); });
     return retval;
 }
 
@@ -423,7 +479,7 @@ int swoole_coroutine_flock(int fd, int operation) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = flock(fd, operation); });
+    async([&]() { retval = flock(fd, operation); });
     return retval;
 }
 
@@ -433,7 +489,7 @@ DIR *swoole_coroutine_opendir(const char *name) {
     }
 
     DIR *retval = nullptr;
-    swoole::coroutine::async([&]() { retval = opendir(name); });
+    async([&]() { retval = opendir(name); });
     return retval;
 }
 
@@ -444,9 +500,7 @@ struct dirent *swoole_coroutine_readdir(DIR *dirp) {
 
     struct dirent *retval;
 
-    swoole::coroutine::async([&retval, dirp]() {
-        retval = readdir(dirp);
-    });
+    async([&retval, dirp]() { retval = readdir(dirp); });
 
     return retval;
 }
@@ -457,7 +511,7 @@ int swoole_coroutine_closedir(DIR *dirp) {
     }
 
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = closedir(dirp); });
+    async([&]() { retval = closedir(dirp); });
     return retval;
 }
 
@@ -470,8 +524,8 @@ void swoole_coroutine_usleep(int usec) {
 }
 
 int swoole_coroutine_socket_set_timeout(int sockfd, int which, double timeout) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         errno = EINVAL;
         return -1;
     }
@@ -488,8 +542,8 @@ int swoole_coroutine_socket_set_timeout(int sockfd, int which, double timeout) {
 }
 
 int swoole_coroutine_socket_set_connect_timeout(int sockfd, double timeout) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         errno = EINVAL;
         return -1;
     }
@@ -498,8 +552,8 @@ int swoole_coroutine_socket_set_connect_timeout(int sockfd, double timeout) {
 }
 
 int swoole_coroutine_socket_wait_event(int sockfd, int event, double timeout) {
-    Socket *socket = get_socket_ex(sockfd);
-    if (sw_unlikely(socket == NULL)) {
+    auto socket = get_socket_ex(sockfd);
+    if (sw_unlikely(socket == nullptr)) {
         errno = EINVAL;
         return -1;
     }
@@ -515,19 +569,143 @@ int swoole_coroutine_getaddrinfo(const char *name,
                                  const struct addrinfo *req,
                                  struct addrinfo **pai) {
     int retval = -1;
-    swoole::coroutine::async([&]() { retval = getaddrinfo(name, service, req, pai); });
+    async([&]() { retval = getaddrinfo(name, service, req, pai); });
     return retval;
 }
 
 struct hostent *swoole_coroutine_gethostbyname(const char *name) {
     struct hostent *retval = nullptr;
-    int _tmp_h_errno;
-    swoole::coroutine::async([&]() {
+    int _tmp_h_errno = 0;
+    async([&]() {
         retval = gethostbyname(name);
         _tmp_h_errno = h_errno;
     });
     h_errno = _tmp_h_errno;
     return retval;
 }
+
+int swoole_coroutine_fsync(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return fsync(fd);
+    }
+
+    int retval = -1;
+    async([&]() { retval = fsync(fd); });
+    return retval;
+}
+
+int swoole_coroutine_fdatasync(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+#ifndef HAVE_FDATASYNC
+        return fsync(fd);
+#else
+        return fdatasync(fd);
+#endif
+    }
+
+    int retval = -1;
+#ifndef HAVE_FDATASYNC
+    async([&]() { retval = fsync(fd); });
+#else
+    async([&]() { retval = fdatasync(fd); });
+#endif
+    return retval;
+}
+
+#ifdef SW_USE_IOURING
+int swoole_coroutine_iouring_open(const char *pathname, int flags, mode_t mode) {
+    if (sw_unlikely(is_no_coro())) {
+        return open(pathname, flags, mode);
+    }
+    return Iouring::open(pathname, flags, mode);
+}
+
+int swoole_coroutine_iouring_close_file(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return close(fd);
+    }
+    return Iouring::close(fd);
+}
+
+ssize_t swoole_coroutine_iouring_read(int sockfd, void *buf, size_t size) {
+    if (sw_unlikely(is_no_coro())) {
+        return read(sockfd, buf, size);
+    }
+    return Iouring::read(sockfd, buf, size);
+}
+
+ssize_t swoole_coroutine_iouring_write(int sockfd, const void *buf, size_t size) {
+    if (sw_unlikely(is_no_coro())) {
+        return write(sockfd, buf, size);
+    }
+    return Iouring::write(sockfd, buf, size);
+}
+
+int swoole_coroutine_iouring_rename(const char *oldpath, const char *newpath) {
+    if (sw_unlikely(is_no_coro())) {
+        return rename(oldpath, newpath);
+    }
+    return Iouring::rename(oldpath, newpath);
+}
+
+int swoole_coroutine_iouring_mkdir(const char *pathname, mode_t mode) {
+    if (sw_unlikely(is_no_coro())) {
+        return mkdir(pathname, mode);
+    }
+    return Iouring::mkdir(pathname, mode);
+}
+
+int swoole_coroutine_iouring_unlink(const char *pathname) {
+    if (sw_unlikely(is_no_coro())) {
+        return unlink(pathname);
+    }
+    return Iouring::unlink(pathname);
+}
+
+#ifdef HAVE_IOURING_STATX
+int swoole_coroutine_iouring_fstat(int fd, struct stat *statbuf) {
+    if (sw_unlikely(is_no_coro())) {
+        return fstat(fd, statbuf);
+    }
+    return Iouring::fstat(fd, statbuf);
+}
+
+int swoole_coroutine_iouring_stat(const char *path, struct stat *statbuf) {
+    if (sw_unlikely(is_no_coro())) {
+        return stat(path, statbuf);
+    }
+    return Iouring::stat(path, statbuf);
+}
+
+int swoole_coroutine_iouring_lstat(const char *path, struct stat *statbuf) {
+    if (sw_unlikely(is_no_coro())) {
+        return lstat(path, statbuf);
+    }
+    // Iouring cannot distinguish between lstat and stat; these two operations are the same
+    return Iouring::stat(path, statbuf);
+}
+#endif
+
+int swoole_coroutine_iouring_rmdir(const char *pathname) {
+    if (sw_unlikely(is_no_coro())) {
+        return rmdir(pathname);
+    }
+    return Iouring::rmdir(pathname);
+}
+
+int swoole_coroutine_iouring_fsync(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return fsync(fd);
+    }
+    return Iouring::fsync(fd);
+}
+
+int swoole_coroutine_iouring_fdatasync(int fd) {
+    if (sw_unlikely(is_no_coro())) {
+        return fdatasync(fd);
+    }
+    return Iouring::fdatasync(fd);
+}
+#endif
 
 SW_EXTERN_C_END

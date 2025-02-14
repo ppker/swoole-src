@@ -19,17 +19,17 @@
 
 namespace swoole {
 
-Coroutine *Coroutine::current = nullptr;
-long Coroutine::last_cid = 0;
-std::unordered_map<long, Coroutine *> Coroutine::coroutines;
-uint64_t Coroutine::peak_num = 0;
-bool Coroutine::activated = false;
+SW_THREAD_LOCAL Coroutine *Coroutine::current = nullptr;
+SW_THREAD_LOCAL long Coroutine::last_cid = 0;
+SW_THREAD_LOCAL std::unordered_map<long, Coroutine *> Coroutine::coroutines;
+SW_THREAD_LOCAL uint64_t Coroutine::peak_num = 0;
+SW_THREAD_LOCAL bool Coroutine::activated = false;
 
-size_t Coroutine::stack_size = SW_DEFAULT_C_STACK_SIZE;
-Coroutine::SwapCallback Coroutine::on_yield = nullptr;
-Coroutine::SwapCallback Coroutine::on_resume = nullptr;
-Coroutine::SwapCallback Coroutine::on_close = nullptr;
-Coroutine::BailoutCallback Coroutine::on_bailout = nullptr;
+SW_THREAD_LOCAL size_t Coroutine::stack_size = SW_DEFAULT_C_STACK_SIZE;
+SW_THREAD_LOCAL Coroutine::SwapCallback Coroutine::on_yield = nullptr;
+SW_THREAD_LOCAL Coroutine::SwapCallback Coroutine::on_resume = nullptr;
+SW_THREAD_LOCAL Coroutine::SwapCallback Coroutine::on_close = nullptr;
+SW_THREAD_LOCAL Coroutine::BailoutCallback Coroutine::on_bailout = nullptr;
 
 #ifdef SW_USE_THREAD_CONTEXT
 namespace coroutine {
@@ -43,6 +43,7 @@ void Coroutine::activate() {
     coroutine::thread_context_init();
 #endif
     activated = true;
+    on_bailout = nullptr;
 }
 
 void Coroutine::deactivate() {
@@ -50,6 +51,12 @@ void Coroutine::deactivate() {
     coroutine::thread_context_clean();
 #endif
     activated = false;
+    on_bailout = [](){
+        // The coroutine scheduler has been destroyed,
+        // Can not resume any coroutine
+        // Expect that never here
+        swoole_error("have been bailout, can not resume any coroutine");
+    };
 }
 
 void Coroutine::yield() {
@@ -79,7 +86,7 @@ bool Coroutine::yield_ex(double timeout) {
     };
 
     if (timeout > 0) {
-        timer = swoole_timer_add((long) (timeout * 1000), false, timer_callback, nullptr);
+        timer = swoole_timer_add(timeout, false, timer_callback, nullptr);
     }
 
     CancelFunc cancel_fn = [](Coroutine *co) {

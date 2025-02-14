@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -65,11 +65,11 @@ struct Session {
 
     void append(const char *data, ssize_t len);
 
-    inline void append(Buffer *buffer) {
+    void append(Buffer *buffer) {
         rxqueue.push_back(buffer);
     }
 
-    inline size_t get_buffer_length() {
+    size_t get_buffer_length() {
         size_t total_length = 0;
         for (auto i : rxqueue) {
             total_length += i->length;

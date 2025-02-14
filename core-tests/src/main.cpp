@@ -1,5 +1,7 @@
 #include "test_core.h"
 
+#include "swoole_proxy.h"
+
 using namespace swoole;
 using namespace std;
 
@@ -25,8 +27,13 @@ int main(int argc, char **argv) {
 
 static void init_root_path(const char *_exec_file) {
     char buf[PATH_MAX];
-    char *dir = getcwd(buf, sizeof(buf));
-    string file = string(dir) + "/" + _exec_file;
+    string file;
+    if (_exec_file[0] == '/') {
+        file = _exec_file;
+    } else {
+        char *dir = getcwd(buf, sizeof(buf));
+        file = string(dir) + "/" + _exec_file;
+    }
     string relative_root_path = file.substr(0, file.rfind('/')) + "/../../";
     char *_realpath = realpath(relative_root_path.c_str(), buf);
     if (_realpath == nullptr) {
@@ -49,6 +56,34 @@ string get_jpg_file() {
 
 bool is_github_ci() {
     return getenv("GITHUB_ACTIONS") != nullptr;
+}
+
+Socks5Proxy *create_socks5_proxy() {
+    auto socks5_proxy = new Socks5Proxy();
+    socks5_proxy->host = std::string(TEST_SOCKS5_PROXY_HOST);
+    socks5_proxy->port = TEST_SOCKS5_PROXY_PORT;
+    socks5_proxy->dns_tunnel = 1;
+    if (is_github_ci()) {
+        socks5_proxy->method = SW_SOCKS5_METHOD_AUTH;
+        socks5_proxy->username = std::string(TEST_SOCKS5_PROXY_USER);
+        socks5_proxy->password = std::string(TEST_SOCKS5_PROXY_PASSWORD);
+    }
+    return socks5_proxy;
+}
+
+HttpProxy *create_http_proxy() {
+    auto http_proxy = new HttpProxy();
+    http_proxy->proxy_host = std::string(TEST_HTTP_PROXY_HOST);
+    http_proxy->proxy_port = TEST_HTTP_PROXY_PORT;
+    if (is_github_ci()) {
+        http_proxy->username = std::string(TEST_HTTP_PROXY_USER);
+        http_proxy->password = std::string(TEST_HTTP_PROXY_PASSWORD);
+    }
+    return http_proxy;
+}
+
+int get_random_port() {
+    return TEST_PORT + swoole_system_random(1, 10000);
 }
 
 }  // namespace test

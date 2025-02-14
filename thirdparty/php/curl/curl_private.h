@@ -17,7 +17,7 @@
 
 /* Copied from PHP-4f68662f5b61aecf90f6d8005976f5f91d4ce8d3 */
 
-#ifdef SW_USE_CURL
+#if defined(SW_USE_CURL) && PHP_VERSION_ID < 80400
 
 #ifndef _PHP_CURL_PRIVATE_H
 #define _PHP_CURL_PRIVATE_H
@@ -68,7 +68,7 @@ typedef struct {
     zval func_name;
     zend_fcall_info_cache fci_cache;
     int method;
-} php_curl_progress, php_curl_fnmatch, php_curlm_server_push;
+} php_curl_progress, php_curl_fnmatch, php_curlm_server_push, php_curl_fnxferinfo, php_curl_sshhostkey;
 
 typedef struct {
     php_curl_write *write;
@@ -76,7 +76,13 @@ typedef struct {
     php_curl_read *read;
     zval std_err;
     php_curl_progress *progress;
+#if LIBCURL_VERSION_NUM >= 0x072000 && PHP_VERSION_ID >= 80200
+    php_curl_fnxferinfo *xferinfo;
+#endif
     php_curl_fnmatch *fnmatch;
+#if LIBCURL_VERSION_NUM >= 0x075400 && PHP_VERSION_ID >= 80300
+    php_curl_sshhostkey  *sshhostkey;
+#endif
 } php_curl_handlers;
 
 struct _php_curl_error {
@@ -105,20 +111,14 @@ struct _php_curl_free {
 
 typedef struct {
     CURL *cp;
-#if PHP_VERSION_ID >= 80100
     php_curl_handlers handlers;
-#else
-    php_curl_handlers *handlers;
-#endif
     struct _php_curl_free *to_free;
     struct _php_curl_send_headers header;
     struct _php_curl_error err;
     zend_bool in_callback;
     uint32_t *clone;
     zval postfields;
-#if PHP_VERSION_ID >= 80100
     zval private_data;
-#endif
     /* CurlShareHandle object set using CURLOPT_SHARE. */
     struct _php_curlsh *share;
     zend_object std;
@@ -139,16 +139,9 @@ class Multi;
 using swoole::curl::Multi;
 
 typedef struct {
-#if PHP_VERSION_ID < 80100
-    int still_running;
-#endif
     Multi *multi;
     zend_llist easyh;
-#if PHP_VERSION_ID >= 80100
     php_curlm_handlers handlers;
-#else
-    php_curlm_handlers *handlers;
-#endif
     struct {
         int no;
     } err;
@@ -180,6 +173,12 @@ static inline php_curl_handlers *curl_handlers(php_curl *ch) {
 }
 #endif
 
+#if PHP_VERSION_ID >= 80200
+typedef zend_result curl_result_t;
+#else
+typedef int curl_result_t;
+#endif
+
 static inline php_curl *curl_from_obj(zend_object *obj) {
     return (php_curl *) ((char *) (obj) -XtOffsetOf(php_curl, std));
 }
@@ -192,9 +191,7 @@ static inline php_curlsh *curl_share_from_obj(zend_object *obj) {
 
 #define Z_CURL_SHARE_P(zv) curl_share_from_obj(Z_OBJ_P(zv))
 void curl_multi_register_class(const zend_function_entry *method_entries);
-int swoole_curl_cast_object(zend_object *obj, zval *result, int type);
-
-php_curl *swoole_curl_get_handle(zval *zid, bool exclusive = true, bool required = true);
+curl_result_t swoole_curl_cast_object(zend_object *obj, zval *result, int type);
 
 #endif /* _PHP_CURL_PRIVATE_H */
 #endif

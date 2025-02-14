@@ -24,6 +24,7 @@ $pm->parentFunc = function ($pid) use ($pm) {
 };
 
 $pm->childFunc = function () use ($pm) {
+    swoole_ignore_error(SWOOLE_ERROR_SERVER_NO_IDLE_WORKER);
     $server = new Server('127.0.0.1', $pm->getFreePort(), SWOOLE_PROCESS);
     $server->set(
         [
@@ -64,4 +65,4 @@ unlink(TMP_LOG_FILE);
 ?>
 --EXPECTF--
 [%s]	WARNING	Socket::send_blocking(): send %d bytes failed, Error: Resource temporarily unavailable[11]
-[%s]	WARNING	Server::reply_task_result() (ERRNO %d): send result to worker timed out
+[%s]	WARNING	Server::finish() (ERRNO %d): send result to worker timed out

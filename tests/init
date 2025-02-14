@@ -36,17 +36,16 @@ function read_sql_file(string $file)
 }
 
 require __DIR__ . '/include/config.php';
+require __DIR__ . '/swoole_pdo_pgsql/pdo_pgsql.inc';
 
 Swoole\Coroutine\run(function () {
     echo "[DB-init] initialization MySQL database...\n";
-    $mysql = new Swoole\Coroutine\MySQL();
-    $connected = $mysql->connect([
-        'host' => MYSQL_SERVER_HOST,
-        'port' => MYSQL_SERVER_PORT,
-        'user' => MYSQL_SERVER_USER,
-        'password' => MYSQL_SERVER_PWD,
-        'database' => MYSQL_SERVER_DB
-    ]);
+    $mysql = new mysqli();
+    $connected = $mysql->connect(MYSQL_SERVER_HOST,
+            MYSQL_SERVER_USER,
+            MYSQL_SERVER_PWD,
+            MYSQL_SERVER_DB,
+            MYSQL_SERVER_PORT);
     if (!$connected) {
         echo "[DB-init] Connect failed! Error#{$mysql->connect_errno}: {$mysql->connect_error}\n";
         exit(1);
@@ -58,5 +57,29 @@ Swoole\Coroutine\run(function () {
             exit(1);
         }
     }
-    echo "[DB-init] Done!\n";
+    echo "[DB-init] MySQL Done!\n";
+
+    echo "[DB-init] initialization ODBC...\n";
+    echo `set -ex`;
+
+    file_put_contents('/etc/odbcinst.ini', "[mysql]" . PHP_EOL
+            . "Driver=libmaodbc.so" . PHP_EOL
+            . "Description=MariaDB Connector/ODBC(Unicode)" . PHP_EOL
+            . "UsageCount=1" . PHP_EOL
+    );
+    echo `odbcinst -q -d -n "mysql"`;
+
+    file_put_contents('/etc/odbc.ini', "[mysql-test]" . PHP_EOL
+            . "Description = MySQL test database" . PHP_EOL
+            . "Trace = On" . PHP_EOL
+            . "TraceFile = stderr" . PHP_EOL
+            . "Driver = mysql" . PHP_EOL
+            . "SERVER = " . MYSQL_SERVER_HOST . PHP_EOL
+            . "USER = " . MYSQL_SERVER_USER . PHP_EOL
+            . "PASSWORD =" . MYSQL_SERVER_PWD . PHP_EOL
+            . "PORT = " . MYSQL_SERVER_PORT . PHP_EOL
+            . "DATABASE = " . MYSQL_SERVER_DB);
+    echo `odbcinst -i -d -f /etc/odbc.ini`;
+
+    echo "[DB-init] ODBC Done!\n";
 });

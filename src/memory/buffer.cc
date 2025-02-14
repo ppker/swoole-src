@@ -19,34 +19,34 @@
 
 namespace swoole {
 
+BufferChunk::BufferChunk(Type type, uint32_t size) : type(type), size(size) {
+    if (type == TYPE_DATA && size > 0) {
+        value.str = new char[size];
+    }
+}
+
+BufferChunk::~BufferChunk() {
+    if (type == TYPE_DATA) {
+        delete[] value.str;
+    }
+    if (destroy) {
+        destroy(this);
+    }
+}
+
 Buffer::Buffer(uint32_t _chunk_size) {
     chunk_size = _chunk_size == 0 ? INT_MAX : _chunk_size;
 }
 
 BufferChunk *Buffer::alloc(BufferChunk::Type type, uint32_t size) {
-    BufferChunk *chunk = new BufferChunk();
-
-    if (type == BufferChunk::TYPE_DATA && size > 0) {
-        chunk->size = size;
-        chunk->value.ptr = new char[size];
-    }
-
-    chunk->type = type;
+    auto *chunk = new BufferChunk(type, size);
     queue_.push(chunk);
-
     return chunk;
 }
 
 void Buffer::pop() {
     BufferChunk *chunk = queue_.front();
-
     total_length -= chunk->size;
-    if (chunk->type == BufferChunk::TYPE_DATA) {
-        delete[] chunk->value.ptr;
-    }
-    if (chunk->destroy) {
-        chunk->destroy(chunk);
-    }
     delete chunk;
     queue_.pop();
 }
@@ -72,7 +72,7 @@ void Buffer::append(const void *data, uint32_t size) {
 
         total_length += _n;
 
-        memcpy(chunk->value.ptr, _pos, _n);
+        memcpy(chunk->value.str, _pos, _n);
         chunk->length = _n;
 
         swoole_trace_log(SW_TRACE_BUFFER, "chunk_n=%lu|size=%u|chunk_len=%u|chunk=%p", count(), _n, chunk->length, chunk);
@@ -111,9 +111,9 @@ void Buffer::append(const struct iovec *iov, size_t iovcnt, off_t offset) {
                     i++;
                     continue;
                 } else {
+                    pos = (char *) iov[i].iov_base + offset;
+                    iov_remain_len = iov[i].iov_len - offset;
                     offset = 0;
-                    pos += offset;
-                    iov_remain_len -= offset;
                 }
             }
             chunk_remain_len = _length >= chunk_size ? chunk_size : _length;
@@ -121,7 +121,7 @@ void Buffer::append(const struct iovec *iov, size_t iovcnt, off_t offset) {
         }
 
         size_t _n = std::min(iov_remain_len, chunk_remain_len);
-        memcpy(chunk->value.ptr + chunk->length, pos, _n);
+        memcpy(chunk->value.str + chunk->length, pos, _n);
         total_length += _n;
         _length -= _n;
 
