@@ -24,10 +24,7 @@
 #include "swoole_http.h"
 #include "swoole_websocket.h"
 #include "swoole_mime_type.h"
-
-#ifdef SW_USE_HTTP2
 #include "swoole_http2.h"
-#endif
 
 bool swoole_http_server_onBeforeRequest(swoole::http::Context *ctx);
 void swoole_http_server_onAfterResponse(swoole::http::Context *ctx);
@@ -39,7 +36,6 @@ void swoole_websocket_onOpen(swoole::http::Context *ctx);
 void swoole_websocket_onRequest(swoole::http::Context *ctx);
 bool swoole_websocket_handshake(swoole::http::Context *ctx);
 
-#ifdef SW_USE_HTTP2
 int swoole_http2_server_parse(swoole::http2::Session *client, const char *buf);
 int swoole_http2_server_onReceive(swoole::Server *serv, swoole::Connection *conn, swoole::RecvData *req);
 void swoole_http2_server_session_free(swoole::Connection *conn);
@@ -49,4 +45,43 @@ int swoole_http2_server_goaway(swoole::http::Context *ctx,
                                const char *debug_data,
                                size_t debug_data_len);
 
-#endif
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, const char *value) {
+    zval tmp;
+    ZVAL_STRING(&tmp, value);
+    zend_hash_add_new(ht, key, &tmp);
+}
+
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, const char *value, size_t length) {
+    zval tmp;
+    ZVAL_STRINGL(&tmp, value, length);
+    zend_hash_add_new(ht, key, &tmp);
+}
+
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, zend_long value) {
+    zval tmp;
+    ZVAL_LONG(&tmp, value);
+    zend_hash_add_new(ht, key, &tmp);
+}
+
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, double value) {
+    zval tmp;
+    ZVAL_DOUBLE(&tmp, value);
+    zend_hash_add_new(ht, key, &tmp);
+}
+
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, zend_string *value) {
+    zval tmp;
+    ZVAL_STR(&tmp, value);
+    zend_hash_add_new(ht, key, &tmp);
+}
+
+static inline void http_server_add_server_array(HashTable *ht, zend_string *key, zval *value) {
+    zend_hash_add_new(ht, key, value);
+}
+
+static inline void http_server_set_object_fd_property(zend_object *object, zend_class_entry *ce, long fd) {
+    zval *zv = zend_hash_find(&ce->properties_info, SW_ZSTR_KNOWN(SW_ZEND_STR_FD));
+    zend_property_info *property_info = (zend_property_info *) Z_PTR_P(zv);
+    zval *property = OBJ_PROP(object, property_info->offset);
+    ZVAL_LONG(property, fd);
+}

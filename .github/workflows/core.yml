@@ -1,0 +1,74 @@
+name: Core Tests
+
+on: [ push, pull_request ]
+
+env:
+  CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '--filter=') || contains(github.event.head_commit.message, '[core]')"
+    timeout-minutes: 10
+    services:
+      tinyproxy:
+        image: "vimagick/tinyproxy"
+        ports:
+          - 8888:8888
+      nginx:
+        image: "nginx"
+        ports:
+          - "80:80"
+        env:
+          NGINX_PORT: "[::]:80"
+      socks5:
+        image: "xkuma/socks5"
+        ports:
+          - 8080:1080
+        env:
+          PROXY_USER: user
+          PROXY_PASSWORD: password
+          PROXY_SERVER: 0.0.0.0:1080
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: sudo apt update -y && sudo apt install -y googletest libgtest-dev redis-server libboost-stacktrace-dev libbrotli-dev
+
+      - name: configure
+        run: phpize && ./configure --enable-sockets --enable-mysqlnd --enable-openssl
+
+      - name: make
+        run: |
+          cmake . -D CODE_COVERAGE=ON -D enable_thread=1
+          make VERBOSE=1 -j $(nproc) lib-swoole
+
+      - name: make test with valgrind
+        if: "contains(github.event.head_commit.message, '--valgrind')"
+        run: |
+          sudo apt install -y valgrind
+          cd core-tests && SWOOLE_VALGRIND=1 ./run.sh
+
+      - name: make test with asan
+        if: "contains(github.event.head_commit.message, '--asan')"
+        run: |
+          cd core-tests && SWOOLE_ENABLE_ASAN=1 ./run.sh
+
+      - name: make test
+        run:
+          cd core-tests && ./run.sh
+
+      - name: run coverage
+        shell: bash
+        run: sudo apt-get install lcov &&
+          sudo lcov --directory . --capture --output-file coverage.info &&
+          sudo lcov --remove coverage.info "${{runner.workspace}}/swoole-src/include/*" '/usr/*' --output-file coverage.info &&
+          sudo lcov --list coverage.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.info
+          fail_ci_if_error: true

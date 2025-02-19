@@ -107,7 +107,7 @@ _dns_lookup:
     if (swoole_coroutine_is_in()) {
         return System::gethostbyname(host_name, ctx->type, ctx->timeout);
     } else {
-        char addr[SW_IP_MAX_LENGTH];
+        char addr[INET6_ADDRSTRLEN] = {};
         if (swoole::network::gethostbyname(ctx->type, host_name.c_str(), sw_tg_buffer()->str) < 0) {
             swoole_set_last_error(SW_ERROR_DNSLOOKUP_RESOLVE_FAILED);
             return "";
@@ -344,7 +344,7 @@ std::vector<std::string> dns_lookup_impl_with_socket(const char *domain, int fam
         temp = &packet[steps];
         j = 0;
         while (*temp != 0) {
-            if ((uchar)(*temp) == 0xc0) {
+            if ((uchar) (*temp) == 0xc0) {
                 ++temp;
                 temp = &packet[(uint8_t) *temp];
             } else {
@@ -373,7 +373,7 @@ std::vector<std::string> dns_lookup_impl_with_socket(const char *domain, int fam
             temp = &packet[steps];
             j = 0;
             while (*temp != 0) {
-                if ((uchar)(*temp) == 0xc0) {
+                if ((uchar) (*temp) == 0xc0) {
                     ++temp;
                     temp = &packet[(uint8_t) *temp];
                 } else {
@@ -767,36 +767,40 @@ int getaddrinfo(GetaddrinfoRequest *req) {
     hints.ai_socktype = req->socktype;
     hints.ai_protocol = req->protocol;
 
-    int ret = ::getaddrinfo(req->hostname, req->service, &hints, &result);
+    int ret = ::getaddrinfo(req->hostname.c_str(), req->service.c_str(), &hints, &result);
     if (ret != 0) {
         req->error = ret;
         return SW_ERR;
     }
 
-    void *buffer = req->result;
     int i = 0;
-    for (ptr = result; ptr != nullptr; ptr = ptr->ai_next) {
+    for (ptr = result; ptr != nullptr; ptr = ptr->ai_next, i++) {
+    }
+    req->count = SW_MIN(i, SW_DNS_HOST_BUFFER_SIZE);
+    req->results.resize(req->count);
+
+    for (ptr = result, i = 0; ptr != nullptr; ptr = ptr->ai_next, i++) {
         switch (ptr->ai_family) {
         case AF_INET:
-            memcpy((char *) buffer + (i * sizeof(struct sockaddr_in)), ptr->ai_addr, sizeof(struct sockaddr_in));
+            memcpy(&req->results[i], ptr->ai_addr, sizeof(struct sockaddr_in));
             break;
         case AF_INET6:
-            memcpy((char *) buffer + (i * sizeof(struct sockaddr_in6)), ptr->ai_addr, sizeof(struct sockaddr_in6));
+            memcpy(&req->results[i], ptr->ai_addr, sizeof(struct sockaddr_in6));
             break;
         default:
             swoole_warning("unknown socket family[%d]", ptr->ai_family);
             break;
         }
-        i++;
         if (i == SW_DNS_HOST_BUFFER_SIZE) {
             break;
         }
     }
     ::freeaddrinfo(result);
     req->error = 0;
-    req->count = i;
+
     return SW_OK;
 }
+}  // namespace network
 
 void GetaddrinfoRequest::parse_result(std::vector<std::string> &retval) {
     struct sockaddr_in *addr_v4;
@@ -805,12 +809,12 @@ void GetaddrinfoRequest::parse_result(std::vector<std::string> &retval) {
     char tmp[INET6_ADDRSTRLEN];
     const char *r;
 
-    for (int i = 0; i < count; i++) {
+    for (auto &addr : results) {
         if (family == AF_INET) {
-            addr_v4 = (struct sockaddr_in *) ((char *) result + (i * sizeof(struct sockaddr_in)));
+            addr_v4 = (struct sockaddr_in *) &addr;
             r = inet_ntop(AF_INET, (const void *) &addr_v4->sin_addr, tmp, sizeof(tmp));
         } else {
-            addr_v6 = (struct sockaddr_in6 *) ((char *) result + (i * sizeof(struct sockaddr_in6)));
+            addr_v6 = (struct sockaddr_in6 *) &addr;
             r = inet_ntop(AF_INET6, (const void *) &addr_v6->sin6_addr, tmp, sizeof(tmp));
         }
         if (r) {
@@ -818,5 +822,4 @@ void GetaddrinfoRequest::parse_result(std::vector<std::string> &retval) {
         }
     }
 }
-}  // namespace network
 }  // namespace swoole

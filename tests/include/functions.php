@@ -88,6 +88,11 @@ function get_one_free_port(): int
     return $port;
 }
 
+function get_constant_port(string $str, int $base = 9500): int
+{
+    return $base + crc32($str) % 10000;
+}
+
 function get_one_free_port_ipv6(): int
 {
     $hookFlags = Swoole\Runtime::getHookFlags();
@@ -148,10 +153,18 @@ function array_random(array $array)
 
 function phpt_echo(...$args)
 {
+    if (!SWOOLE_TEST_ECHO) {
+        return;
+    }
     global $argv;
     if (substr($argv[0], -5) === '.phpt') {
         foreach ($args as $arg) {
-            echo $arg;
+            if (!is_string($arg)) {
+                var_export($arg);
+                echo PHP_EOL;
+            } else {
+                echo $arg;
+            }
         }
     }
 }
@@ -161,6 +174,15 @@ function phpt_var_dump(...$args)
     global $argv;
     if (substr($argv[0], -5) === '.phpt') {
         var_dump(...$args);
+    }
+}
+
+function phpt_show_usage()
+{
+    global $argv;
+    if (substr($argv[0], -5) === '.phpt') {
+        var_dump('memory:' . memory_get_usage());
+        var_dump('coroutine:' . var_export(Co::stats(), 1));
     }
 }
 
@@ -363,7 +385,7 @@ function get_big_random(int $length = 1024 * 1024)
     return str_repeat(get_safe_random(1024), $length / 1024);
 }
 
-function makeCoTcpClient($host, $port, callable $onConnect = null, callable $onReceive = null)
+function makeCoTcpClient($host, $port, ?callable $onConnect = null, ?callable $onReceive = null)
 {
     go(function () use ($host, $port, $onConnect, $onReceive) {
         $cli = new Swoole\Coroutine\Client(SWOOLE_SOCK_TCP);
@@ -440,7 +462,7 @@ function killself_in_syncmode($lifetime = 1000, $sig = SIGKILL)
  * @param callable $cb
  * @return mixed
  */
-function suicide($lifetime, $sig = SIGKILL, callable $cb = null)
+function suicide($lifetime, $sig = SIGKILL, ?callable $cb = null)
 {
     return Swoole\Timer::after($lifetime, function () use ($lifetime, $sig, $cb) {
         if ($cb) {
@@ -497,8 +519,11 @@ function pstree()
     }
     $y = function ($pid, $path = []) use (&$y, $pinfo) {
         if (isset($pinfo[$pid])) {
-            list($ppid,) = $pinfo[$pid];
-            $ppid = $ppid;
+            if (isset($pinfo[$pid][0])) {
+                list($ppid,) = $pinfo[$pid];
+            } else {
+                $ppid = null;
+            }
             $path[] = $pid;
             return $y($ppid, $path);
         } else {
@@ -659,7 +684,7 @@ function php_fork_exec(callable $fn, $f_stdout = "/dev/null", $f_stderr = null)
  * @param array|null $env env
  * @return array [out, err]
  */
-function spawn_exec($cmd, $input = null, $tv_sec = null, $tv_usec = null, $cwd = null, array $env = null)
+function spawn_exec($cmd, $input = null, $tv_sec = null, $tv_usec = null, $cwd = null, ?array $env = null)
 {
     $out = $err = null;
     $winOpt = ['suppress_errors' => true, 'binary_pipes' => true];
@@ -828,5 +853,22 @@ function swoole_loop($fn)
     $i = 0;
     while (true) {
         $fn($i++);
+    }
+}
+
+function build_ftp_url(string $path = ''): string
+{
+    return 'ftp://' . FTP_USER . ':' . FTP_PASS . '@' . FTP_HOST . ':' .  FTP_PORT . '/' . $path;
+}
+
+function get_thread_name(): string
+{
+    return trim(file_get_contents('/proc/' . posix_getpid() . '/task/' . \Swoole\Thread::getNativeId() . '/comm'));
+}
+
+function mkdir_if_not_exists(string $string): void
+{
+    if (!is_dir($string)) {
+        mkdir($string, 0777, true);
     }
 }

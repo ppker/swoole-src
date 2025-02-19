@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -29,11 +29,9 @@ class Lock {
     enum Type {
         NONE,
         RW_LOCK = 1,
-        FILE_LOCK = 2,
         MUTEX = 3,
-        SEM = 4,
         SPIN_LOCK = 5,
-        ATOMIC_LOCK = 6,
+        COROUTINE_LOCK = 6,
     };
     Type get_type() {
         return type_;
@@ -58,6 +56,7 @@ struct MutexImpl;
 
 class Mutex : public Lock {
     MutexImpl *impl;
+    int flags_;
 
   public:
     enum Flag {
@@ -106,4 +105,41 @@ class SpinLock : public Lock {
     int trylock() override;
 };
 #endif
+
+class CoroutineLock : public Lock {
+  private:
+    long cid = 0;
+    sw_atomic_t *value = nullptr;
+    void *coroutine = nullptr;
+
+    int lock_impl(bool blocking = true);
+
+  public:
+    CoroutineLock(bool shared);
+    ~CoroutineLock();
+    int lock_rd() override;
+    int lock() override;
+    int unlock() override;
+    int trylock_rd() override;
+    int trylock() override;
+};
+
+#if defined(HAVE_PTHREAD_BARRIER) && !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__))
+#define SW_USE_PTHREAD_BARRIER
+#endif
+
+struct Barrier {
+#ifdef SW_USE_PTHREAD_BARRIER
+    pthread_barrier_t barrier_;
+    pthread_barrierattr_t barrier_attr_;
+    bool shared_;
+#else
+    sw_atomic_t count_;
+    sw_atomic_t barrier_;
+#endif
+    void init(bool shared, int count);
+    void wait();
+    void destroy();
+};
+
 }  // namespace swoole

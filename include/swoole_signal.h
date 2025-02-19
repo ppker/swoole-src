@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   +----------------------------------------------------------------------+
 */
 
@@ -37,6 +37,7 @@ void swoole_signalfd_init();
 #endif
 
 SW_API swSignalHandler swoole_signal_set(int signo, swSignalHandler func);
+SW_API bool swoole_signal_isset(int signo);
 SW_API swSignalHandler swoole_signal_set(int signo, swSignalHandler func, int restart, int mask);
 SW_API swSignalHandler swoole_signal_get_handler(int signo);
 

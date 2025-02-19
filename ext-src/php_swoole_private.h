@@ -62,6 +62,7 @@ extern PHPAPI int php_array_merge(zend_array *dest, zend_array *src);
     } else {                                                                                                           \
         RETURN_TRUE;                                                                                                   \
     }
+
 #define SW_LOCK_CHECK_RETURN(s)                                                                                        \
     zend_long ___tmp_return_value = s;                                                                                 \
     if (___tmp_return_value == 0) {                                                                                    \
@@ -71,14 +72,43 @@ extern PHPAPI int php_array_merge(zend_array *dest, zend_array *src);
         RETURN_FALSE;                                                                                                  \
     }
 
+#ifdef SW_THREAD
+#define SW_MUST_BE_MAIN_THREAD_EX(op)                                                                                  \
+    if (!tsrm_is_main_thread()) {                                                                                      \
+        swoole_set_last_error(SW_ERROR_OPERATION_NOT_SUPPORT);                                                         \
+        op;                                                                                                            \
+    }
+#define SW_MUST_BE_MAIN_THREAD() SW_MUST_BE_MAIN_THREAD_EX(RETURN_TRUE)
+#else
+#define SW_MUST_BE_MAIN_THREAD_EX(op)
+#define SW_MUST_BE_MAIN_THREAD()
+#endif
+
 #define php_swoole_fatal_error(level, fmt_str, ...)                                                                    \
+    swoole_set_last_error(SW_ERROR_PHP_FATAL_ERROR);                                                                   \
     php_error_docref(NULL, level, (const char *) (fmt_str), ##__VA_ARGS__)
 
+/**
+ * The error occurred at the PHP layer and no error code was set
+ */
 #define php_swoole_error(level, fmt_str, ...)                                                                          \
-    if (SWOOLE_G(display_errors) || level == E_ERROR) php_swoole_fatal_error(level, fmt_str, ##__VA_ARGS__)
+    swoole_set_last_error(SW_ERROR_PHP_RUNTIME_NOTICE);                                                                \
+    if (SWOOLE_G(display_errors) || level == E_ERROR) php_error_docref(NULL, level, fmt_str, ##__VA_ARGS__)
+
+/**
+ * The error occurred in the core must have error code
+ */
+#define php_swoole_core_error(level, fmt_str, ...)                                                                     \
+    if (SWOOLE_G(display_errors) || level == E_ERROR) php_error_docref(NULL, level, fmt_str, ##__VA_ARGS__)
+
+#define php_swoole_error_ex(level, err_code, fmt_str, ...)                                                             \
+    swoole_set_last_error(err_code);                                                                                   \
+    if (SWOOLE_G(display_errors) || level == E_ERROR) php_error_docref(NULL, level, fmt_str, ##__VA_ARGS__)
 
 #define php_swoole_sys_error(level, fmt_str, ...)                                                                      \
-    php_swoole_error(level, fmt_str ", Error: %s[%d]", ##__VA_ARGS__, strerror(errno), errno)
+    swoole_set_last_error(errno);                                                                                      \
+    if (SWOOLE_G(display_errors) || level == E_ERROR)                                                                  \
+    php_error_docref(NULL, level, fmt_str ", Error: %s[%d]", ##__VA_ARGS__, strerror(errno), errno)
 
 #ifdef SW_USE_CARES
 #ifndef HAVE_CARES
@@ -86,17 +116,33 @@ extern PHPAPI int php_array_merge(zend_array *dest, zend_array *src);
 #endif
 #endif
 
+#if defined(SW_HAVE_ZLIB) || defined(SW_HAVE_BROTLI) || defined(SW_HAVE_ZSTD)
+#define SW_HAVE_COMPRESSION
+#endif
+
 #ifdef SW_SOCKETS
 #include "ext/sockets/php_sockets.h"
 #define SWOOLE_SOCKETS_SUPPORT
 #endif
 
-#if PHP_VERSION_ID < 80000
-#error "require PHP version 8.0 or later"
+#if PHP_VERSION_ID < 80100
+#error "require PHP version 8.1 or later"
+#endif
+
+#if PHP_VERSION_ID > 80500
+#error "require PHP version 8.4 or earlier"
 #endif
 
 #if defined(ZTS) && defined(SW_USE_THREAD_CONTEXT)
 #error "thread context cannot be used with ZTS"
+#endif
+
+#if defined(SW_USE_IOURING) && !defined(__linux__)
+#error "only linux support iouring"
+#endif
+
+#if defined(SW_THREAD) && !defined(ZTS)
+#error "swoole thread must be used with ZTS"
 #endif
 
 //--------------------------------------------------------
@@ -149,7 +195,7 @@ enum php_swoole_hook_type {
 };
 //---------------------------------------------------------
 
-static sw_inline enum swSocketType php_swoole_socktype(long type) {
+static sw_inline enum swSocketType php_swoole_get_socket_type(long type) {
     return (enum swSocketType)(type & (~SW_FLAG_SYNC) & (~SW_FLAG_ASYNC) & (~SW_FLAG_KEEP) & (~SW_SOCK_SSL));
 }
 
@@ -157,6 +203,7 @@ extern zend_class_entry *swoole_event_ce;
 extern zend_class_entry *swoole_timer_ce;
 extern zend_class_entry *swoole_socket_coro_ce;
 extern zend_class_entry *swoole_client_ce;
+extern zend_object_handlers swoole_client_handlers;
 extern zend_class_entry *swoole_server_ce;
 extern zend_object_handlers swoole_server_handlers;
 extern zend_class_entry *swoole_redis_server_ce;
@@ -220,49 +267,78 @@ void php_swoole_timer_minit(int module_number);
 void php_swoole_coroutine_minit(int module_number);
 void php_swoole_coroutine_system_minit(int module_number);
 void php_swoole_coroutine_scheduler_minit(int module_number);
+void php_swoole_coroutine_lock_minit(int module_number);
 void php_swoole_channel_coro_minit(int module_number);
 void php_swoole_runtime_minit(int module_number);
 // client
 void php_swoole_socket_coro_minit(int module_number);
 void php_swoole_client_minit(int module_number);
+void php_swoole_client_async_minit(int module_number);
 void php_swoole_client_coro_minit(int module_number);
 void php_swoole_http_client_coro_minit(int module_number);
-void php_swoole_mysql_coro_minit(int module_number);
-void php_swoole_redis_coro_minit(int module_number);
-#ifdef SW_USE_PGSQL
-void php_swoole_postgresql_coro_minit(int module_number);
-#endif
-#ifdef SW_USE_HTTP2
 void php_swoole_http2_client_coro_minit(int module_number);
+#ifdef SW_USE_PGSQL
+void php_swoole_pgsql_minit(int module_number);
+#endif
+#ifdef SW_USE_ODBC
+int php_swoole_odbc_minit(int module_id);
+#endif
+#ifdef SW_USE_ORACLE
+void php_swoole_oracle_minit(int module_number);
+#endif
+#ifdef SW_USE_SQLITE
+void php_swoole_sqlite_minit(int module_number);
 #endif
 // server
 void php_swoole_server_minit(int module_number);
 void php_swoole_server_port_minit(int module_number);
 void php_swoole_http_request_minit(int module_number);
 void php_swoole_http_response_minit(int module_number);
+void php_swoole_http_cookie_minit(int module_number);
 void php_swoole_http_server_minit(int module_number);
 void php_swoole_http_server_coro_minit(int module_number);
 void php_swoole_websocket_server_minit(int module_number);
 void php_swoole_redis_server_minit(int module_number);
 void php_swoole_name_resolver_minit(int module_number);
+#ifdef SW_THREAD
+void php_swoole_thread_minit(int module_number);
+void php_swoole_thread_atomic_minit(int module_number);
+void php_swoole_thread_lock_minit(int module_number);
+void php_swoole_thread_barrier_minit(int module_number);
+void php_swoole_thread_queue_minit(int module_number);
+void php_swoole_thread_map_minit(int module_number);
+void php_swoole_thread_arraylist_minit(int module_number);
+#endif
 
 /**
  * RINIT
  * ==============================================================
  */
+void php_swoole_http_server_rinit();
+void php_swoole_websocket_server_rinit();
 void php_swoole_coroutine_rinit();
 void php_swoole_runtime_rinit();
+#ifdef SW_USE_ORACLE
+void php_swoole_oracle_rinit();
+#endif
+void php_swoole_thread_rinit();
 
 /**
  * RSHUTDOWN
  * ==============================================================
  */
+void php_swoole_http_server_rshutdown();
+void php_swoole_websocket_server_rshutdown();
 void php_swoole_async_coro_rshutdown();
 void php_swoole_redis_server_rshutdown();
 void php_swoole_coroutine_rshutdown();
+void php_swoole_process_rshutdown();
 void php_swoole_coroutine_scheduler_rshutdown();
 void php_swoole_runtime_rshutdown();
 void php_swoole_server_rshutdown();
+#ifdef SW_THREAD
+void php_swoole_thread_rshutdown();
+#endif
 
 int php_swoole_reactor_init();
 void php_swoole_set_global_option(zend_array *vht);
@@ -283,6 +359,16 @@ void php_swoole_event_exit();
  * ==============================================================
  */
 void php_swoole_runtime_mshutdown();
+void php_swoole_websocket_server_mshutdown();
+#ifdef SW_USE_PGSQL
+void php_swoole_pgsql_mshutdown();
+#endif
+#ifdef SW_USE_ORACLE
+void php_swoole_oracle_mshutdown();
+#endif
+#ifdef SW_USE_SQLITE
+void php_swoole_sqlite_mshutdown();
+#endif
 
 static sw_inline zend_bool php_swoole_websocket_frame_is_object(zval *zdata) {
     return Z_TYPE_P(zdata) == IS_OBJECT && instanceof_function(Z_OBJCE_P(zdata), swoole_websocket_frame_ce);
@@ -301,22 +387,24 @@ int php_swoole_convert_to_fd_ex(zval *zsocket, int *async);
 php_socket *php_swoole_convert_to_socket(int sock);
 #endif
 
+#ifdef HAVE_CPU_AFFINITY
+bool php_swoole_array_to_cpu_set(zval *array, cpu_set_t *cpu_set);
+void php_swoole_cpu_set_to_array(zval *array, cpu_set_t *cpu_set);
+#endif
+
 zend_bool php_swoole_signal_isset_handler(int signo);
 
+#if PHP_VERSION_ID < 80200
+#define zend_atomic_bool zend_bool
+#define zend_atomic_bool_store(atomic, desired) (*atomic = desired)
+#endif
+
 #define sw_zend7_object zend_object
-#define SW_Z7_OBJ_P(object) object
 #define SW_Z8_OBJ_P(zobj) Z_OBJ_P(zobj)
 
 typedef ssize_t php_stream_size_t;
-
-#define ZEND_ERROR_CB_LAST_ARG_D zend_string *message
-#define ZEND_ERROR_CB_LAST_ARG_RELAY message
-
-#if PHP_VERSION_ID < 80100
-typedef const char error_filename_t;
-#else
 typedef zend_string error_filename_t;
-#endif
+
 //----------------------------------Zval API------------------------------------
 
 // Deprecated: do not use it anymore
@@ -339,6 +427,12 @@ static sw_inline zend_bool ZVAL_IS_BOOL(zval *v) {
 #ifndef ZVAL_IS_TRUE
 static sw_inline zend_bool ZVAL_IS_TRUE(zval *v) {
     return Z_TYPE_P(v) == IS_TRUE;
+}
+#endif
+
+#ifndef ZVAL_IS_UNDEF
+static sw_inline zend_bool ZVAL_IS_UNDEF(zval *v) {
+    return Z_TYPE_P(v) == IS_UNDEF;
 }
 #endif
 
@@ -393,6 +487,50 @@ static sw_inline void sw_zval_free(zval *val) {
     efree(val);
 }
 
+#ifdef SWOOLE_SOCKETS_SUPPORT
+static inline bool sw_zval_is_php_socket(zval *val) {
+    return instanceof_function(Z_OBJCE_P(val), socket_ce);
+}
+#endif
+
+static inline bool sw_zval_is_co_socket(zval *val) {
+    return instanceof_function(Z_OBJCE_P(val), swoole_socket_coro_ce);
+}
+
+static inline bool sw_zval_is_client(zval *val) {
+    return instanceof_function(Z_OBJCE_P(val), swoole_client_ce);
+}
+
+static inline bool sw_zval_is_process(zval *val) {
+    return instanceof_function(Z_OBJCE_P(val), swoole_process_ce);
+}
+
+bool sw_zval_is_serializable(zval *struc);
+
+static inline bool sw_is_main_thread() {
+#ifdef SW_THREAD
+    return tsrm_is_main_thread();
+#else
+    return true;
+#endif
+}
+
+#ifdef SW_THREAD
+size_t sw_active_thread_count(void);
+#else
+static inline size_t sw_active_thread_count(void) {
+    return 1;
+}
+#endif
+
+zend_refcounted *sw_get_refcount_ptr(zval *value);
+
+void sw_php_exit(int status);
+void sw_php_print_backtrace(zend_long cid = 0,
+                            zend_long options = 0,
+                            zend_long limit = 0,
+                            zval *return_value = nullptr);
+
 //----------------------------------Constant API------------------------------------
 
 #define SW_REGISTER_NULL_CONSTANT(name) REGISTER_NULL_CONSTANT(name, CONST_CS | CONST_PERSISTENT)
@@ -423,7 +561,7 @@ static sw_inline void sw_zval_free(zval *val) {
 static sw_inline zend_string *sw_zend_string_recycle(zend_string *s, size_t alloc_len, size_t real_len) {
     SW_ASSERT(!ZSTR_IS_INTERNED(s));
     if (UNEXPECTED(alloc_len != real_len)) {
-        if (alloc_len > SwooleG.pagesize && alloc_len > real_len * 2) {
+        if (alloc_len > swoole_pagesize() && alloc_len > real_len * 2) {
             s = zend_string_realloc(s, real_len, 0);
         } else {
             ZSTR_LEN(s) = real_len;
@@ -566,15 +704,17 @@ static sw_inline void add_assoc_ulong_safe(zval *arg, const char *key, zend_ulon
         }                                                                                                              \
     } while (0)
 
-#define SW_FUNCTION_ALIAS(origin_function_table, origin, alias_function_table, alias)                                  \
-    sw_zend_register_function_alias(origin_function_table, ZEND_STRL(origin), alias_function_table, ZEND_STRL(alias))
+#define SW_FUNCTION_ALIAS(origin_function_table, origin, alias_function_table, alias, arg_info)                        \
+    sw_zend_register_function_alias(                                                                                   \
+        origin_function_table, ZEND_STRL(origin), alias_function_table, ZEND_STRL(alias), arg_info)
 
 static sw_inline int sw_zend_register_function_alias(zend_array *origin_function_table,
                                                      const char *origin,
                                                      size_t origin_length,
                                                      zend_array *alias_function_table,
                                                      const char *alias,
-                                                     size_t alias_length) {
+                                                     size_t alias_length,
+                                                     const zend_internal_arg_info *arg_info) {
     zend_string *lowercase_origin = zend_string_alloc(origin_length, 0);
     zend_str_tolower_copy(ZSTR_VAL(lowercase_origin), origin, origin_length);
     zend_function *origin_function = (zend_function *) zend_hash_find_ptr(origin_function_table, lowercase_origin);
@@ -585,14 +725,11 @@ static sw_inline int sw_zend_register_function_alias(zend_array *origin_function
     SW_ASSERT(origin_function->common.type == ZEND_INTERNAL_FUNCTION);
     char *_alias = (char *) emalloc(alias_length + 1);
     ((char *) memcpy(_alias, alias, alias_length))[alias_length] = '\0';
-    zend_function_entry zfe[] = {{_alias,
-                                  origin_function->internal_function.handler,
-                                  ((zend_internal_arg_info *) origin_function->common.arg_info) - 1,
-                                  origin_function->common.num_args,
-                                  0},
-                                 PHP_FE_END};
-    int ret =
-        zend_register_functions(origin_function->common.scope, zfe, alias_function_table, origin_function->common.type);
+
+    zend_function_entry zfe[] = {
+        {_alias, origin_function->internal_function.handler, arg_info, origin_function->common.num_args, 0},
+        PHP_FE_END};
+    int ret = zend_register_functions(nullptr, zfe, alias_function_table, origin_function->common.type);
     efree(_alias);
     return ret;
 }
@@ -649,7 +786,7 @@ static sw_inline void sw_zend_class_unset_property_deny(zend_object *object, zen
     std_object_handlers.unset_property(object, member, cache_slot);
 }
 
-static sw_inline zval *sw_zend_read_property(zend_class_entry *ce, zval *obj, const char *s, int len, int silent) {
+static sw_inline zval *sw_zend_read_property(zend_class_entry *ce, zval *obj, const char *s, size_t len, int silent) {
     zval rv, *property = zend_read_property(ce, SW_Z8_OBJ_P(obj), s, len, silent, &rv);
     if (UNEXPECTED(property == &EG(uninitialized_zval))) {
         zend_update_property_null(ce, SW_Z8_OBJ_P(obj), s, len);
@@ -665,17 +802,18 @@ static sw_inline void sw_zend_update_property_null_ex(zend_class_entry *scope, z
     zend_update_property_ex(scope, SW_Z8_OBJ_P(object), s, &tmp);
 }
 
-static sw_inline zval *sw_zend_read_property_ex(zend_class_entry *ce, zval *obj, zend_string *s, int silent) {
-    zval rv, *property = zend_read_property_ex(ce, SW_Z8_OBJ_P(obj), s, silent, &rv);
+static sw_inline zval *sw_zend_read_property_ex(zend_class_entry *ce, zval *zobject, zend_string *name, int silent) {
+    zval *zv = zend_hash_find(&ce->properties_info, name);
+    zend_property_info *property_info = (zend_property_info *) Z_PTR_P(zv);
+    zval *property = OBJ_PROP(SW_Z8_OBJ_P(zobject), property_info->offset);
     if (UNEXPECTED(property == &EG(uninitialized_zval))) {
-        sw_zend_update_property_null_ex(ce, obj, s);
-        return zend_read_property_ex(ce, SW_Z8_OBJ_P(obj), s, silent, &rv);
+        ZVAL_NULL(property);
     }
     return property;
 }
 
 static sw_inline zval *sw_zend_read_property_not_null(
-    zend_class_entry *ce, zval *obj, const char *s, int len, int silent) {
+    zend_class_entry *ce, zval *obj, const char *s, size_t len, int silent) {
     zval rv, *property = zend_read_property(ce, SW_Z8_OBJ_P(obj), s, len, silent, &rv);
     zend_uchar type = Z_TYPE_P(property);
     return (type == IS_NULL || UNEXPECTED(type == IS_UNDEF)) ? NULL : property;
@@ -687,7 +825,10 @@ static sw_inline zval *sw_zend_read_property_not_null_ex(zend_class_entry *ce, z
     return (type == IS_NULL || UNEXPECTED(type == IS_UNDEF)) ? NULL : property;
 }
 
-static sw_inline zval *sw_zend_update_and_read_property_array(zend_class_entry *ce, zval *obj, const char *s, int len) {
+static sw_inline zval *sw_zend_update_and_read_property_array(zend_class_entry *ce,
+                                                              zval *obj,
+                                                              const char *s,
+                                                              size_t len) {
     zval ztmp;
     array_init(&ztmp);
     zend_update_property(ce, SW_Z8_OBJ_P(obj), s, len, &ztmp);
@@ -696,7 +837,7 @@ static sw_inline zval *sw_zend_update_and_read_property_array(zend_class_entry *
 }
 
 static sw_inline zval *sw_zend_read_and_convert_property_array(
-    zend_class_entry *ce, zval *obj, const char *s, int len, int silent) {
+    zend_class_entry *ce, zval *obj, const char *s, size_t len, int silent) {
     zval rv, *property = zend_read_property(ce, SW_Z8_OBJ_P(obj), s, len, silent, &rv);
     if (Z_TYPE_P(property) != IS_ARRAY) {
         // NOTICE: if user unset the property, zend_read_property will return uninitialized_zval instead of NULL pointer
@@ -758,7 +899,8 @@ static sw_inline zend_bool sw_zend_is_callable_at_frame(zval *zcallable,
                                                         size_t *callable_name_len,
                                                         zend_fcall_info_cache *fci_cache,
                                                         char **error) {
-    zend_bool ret = zend_is_callable_at_frame(zcallable, zobject ? Z_OBJ_P(zobject) : NULL, frame, check_flags, fci_cache, error);
+    zend_bool ret =
+        zend_is_callable_at_frame(zcallable, zobject ? Z_OBJ_P(zobject) : NULL, frame, check_flags, fci_cache, error);
     zend_string *name = zend_get_callable_name_ex(zcallable, zobject ? Z_OBJ_P(zobject) : NULL);
     if (callable_name) {
         *callable_name = estrndup(ZSTR_VAL(name), ZSTR_LEN(name));
@@ -824,19 +966,12 @@ static sw_inline int sw_zend_call_function_ex2(
 
 static sw_inline int sw_zend_call_function_anyway(zend_fcall_info *fci, zend_fcall_info_cache *fci_cache) {
     zval retval;
-    zend_object *exception = EG(exception);
-    if (exception) {
-        EG(exception) = NULL;
-    }
     if (!fci->retval) {
         fci->retval = &retval;
     }
     int ret = zend_call_function(fci, fci_cache);
     if (fci->retval == &retval) {
         zval_ptr_dtor(&retval);
-    }
-    if (exception) {
-        EG(exception) = exception;
     }
     return ret;
 }
@@ -880,12 +1015,6 @@ static sw_inline void sw_zend_fci_cache_discard(zend_fcall_info_cache *fci_cache
     }
 }
 
-/* use void* to match some C callback function pointers */
-static sw_inline void sw_zend_fci_cache_free(void *fci_cache) {
-    sw_zend_fci_cache_discard((zend_fcall_info_cache *) fci_cache);
-    efree((zend_fcall_info_cache *) fci_cache);
-}
-
 #if PHP_VERSION_ID >= 80100
 #define sw_php_spl_object_hash(o) php_spl_object_hash(Z_OBJ_P(o))
 #else
@@ -912,7 +1041,7 @@ static sw_inline char *php_swoole_format_date(char *format, size_t format_len, t
     return return_str;
 }
 
-static sw_inline char *php_swoole_url_encode(const char *value, size_t value_len, int *exten) {
+static sw_inline char *php_swoole_url_encode(const char *value, size_t value_len, size_t *exten) {
     zend_string *str = php_url_encode(value, value_len);
     *exten = ZSTR_LEN(str);
     char *return_str = estrndup(ZSTR_VAL(str), ZSTR_LEN(str));
@@ -922,7 +1051,11 @@ static sw_inline char *php_swoole_url_encode(const char *value, size_t value_len
 
 static sw_inline char *php_swoole_http_build_query(zval *zdata, size_t *length, smart_str *formstr) {
     if (HASH_OF(zdata)) {
+#if PHP_VERSION_ID < 80300
         php_url_encode_hash_ex(HASH_OF(zdata), formstr, NULL, 0, NULL, 0, NULL, 0, NULL, NULL, (int) PHP_QUERY_RFC1738);
+#else
+        php_url_encode_hash_ex(HASH_OF(zdata), formstr, NULL, 0, NULL, NULL, NULL, (int) PHP_QUERY_RFC1738);
+#endif
     } else {
         if (formstr->s) {
             smart_str_free(formstr);

@@ -29,7 +29,6 @@ else
         swoole_process \
         swoole_process_pool \
         swoole_table \
-        \
         swoole_coroutine* \
         swoole_channel_coro \
         swoole_client_coro \
@@ -39,8 +38,6 @@ else
         swoole_http_server \
         swoole_websocket_server \
         swoole_redis_server \
-        swoole_mysql_coro \
-        swoole_redis_coro \
         swoole_socket_coro \
         swoole_runtime"
         if [ ${#} -gt 1 ]; then
@@ -50,6 +47,10 @@ else
         fi
     else
         glob="$@"
+        if [ $(expr substr "$glob" 1 6) = "tests/" ]; then
+            # 去掉 tests/ 前缀
+            glob="${glob#tests/}"
+        fi
     fi
 fi
 

@@ -91,8 +91,8 @@ static inline Table *php_swoole_table_get_ptr(zval *zobject) {
 
 static inline Table *php_swoole_table_get_and_check_ptr(zval *zobject) {
     Table *table = php_swoole_table_get_ptr(zobject);
-    if (!table) {
-        php_swoole_fatal_error(E_ERROR, "you must call Table constructor first");
+    if (UNEXPECTED(!table)) {
+        swoole_fatal_error(SW_ERROR_WRONG_OPERATION, "must call constructor first");
     }
     return table;
 }
@@ -110,10 +110,6 @@ static void inline php_swoole_table_set_ptr(zval *zobject, Table *ptr) {
 }
 
 static inline void php_swoole_table_free_object(zend_object *object) {
-    Table *table = php_swoole_table_fetch_object(object)->ptr;
-    if (table) {
-        table->free();
-    }
     zend_object_std_dtor(object);
 }
 

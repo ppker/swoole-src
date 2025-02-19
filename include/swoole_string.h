@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -23,7 +23,16 @@
 
 #define SW_STRINGL(s) s->str, s->length
 #define SW_STRINGS(s) s->str, s->size
+// copy value
 #define SW_STRINGCVL(s) s->str + s->offset, s->length - s->offset
+// append value
+#define SW_STRINGAVL(s) s->str + s->length, s->size - s->length
+/**
+ * This function does not automatically expand memory;
+ * ensure that the value to be written is less than the actual remaining capacity (size-length).
+ * If the size of the value cannot be determined, should use the String::format() function.
+ */
+#define SW_STRING_FORMAT(s, format, ...) s->length += sw_snprintf(SW_STRINGAVL(s), format, ##__VA_ARGS__)
 
 namespace swoole {
 
@@ -79,10 +88,13 @@ class String {
     }
 
     String(const char *_str, size_t _length) {
-        alloc(_length, nullptr);
+        alloc(_length + 1, nullptr);
         memcpy(str, _str, _length);
+        str[_length] = '\0';
         length = _length;
     }
+
+    String(const std::string &_str) : String(_str.c_str(), _str.length()) {}
 
     String(String &_str) {
         alloc(_str.size, _str.allocator);
@@ -126,31 +138,31 @@ class String {
         }
     }
 
-    inline char *value() {
+    char *value() {
         return str;
     }
 
-    inline size_t get_length() {
+    size_t get_length() {
         return length;
     }
 
-    inline size_t capacity() {
+    size_t capacity() {
         return size;
     }
 
-    inline std::string to_std_string() {
+    std::string to_std_string() {
         return std::string(str, length);
     }
 
-    inline bool contains(const char *needle, size_t l_needle) {
+    bool contains(const char *needle, size_t l_needle) {
         return swoole_strnstr(str, length, needle, l_needle) != nullptr;
     }
 
-    inline bool contains(const std::string &needle) {
+    bool contains(const std::string &needle) {
         return contains(needle.c_str(), needle.size());
     }
 
-    inline bool grow(size_t incr_value) {
+    bool grow(size_t incr_value) {
         length += incr_value;
         if (length == size && !reserve(size * 2)) {
             return false;
@@ -172,21 +184,21 @@ class String {
         return str == nullptr || length == 0;
     }
 
-    inline void clear() {
+    void clear() {
         length = 0;
         offset = 0;
     }
 
-    inline bool extend() {
+    bool extend() {
         return extend(size * 2);
     }
 
-    inline bool extend(size_t new_size) {
+    bool extend(size_t new_size) {
         assert(new_size > size);
         return reserve(new_size);
     }
 
-    inline bool extend_align(size_t _new_size) {
+    bool extend_align(size_t _new_size) {
         size_t align_size = SW_MEM_ALIGNED_SIZE(size * 2);
         while (align_size < _new_size) {
             align_size *= 2;
@@ -195,18 +207,23 @@ class String {
     }
 
     bool reserve(size_t new_size);
+    /**
+     * Transfer ownership of the string content pointer to the caller, who will capture this memory.
+     * The caller must manage and free this memory; it will not free when the string is destructed.
+     */
+    char *release();
     bool repeat(const char *data, size_t len, size_t n);
     int append(const char *append_str, size_t length);
 
-    inline int append(const std::string &append_str) {
+    int append(const std::string &append_str) {
         return append(append_str.c_str(), append_str.length());
     }
 
-    inline int append(char c) {
+    int append(char c) {
         return append(&c, sizeof(c));
     }
 
-    inline int append(const String &append_str) {
+    int append(const String &append_str) {
         size_t new_size = length + append_str.length;
         if (new_size > size) {
             if (!reserve(new_size)) {
@@ -219,10 +236,10 @@ class String {
         return SW_OK;
     }
 
-    inline void write(off_t _offset, String *write_str) {
+    void write(off_t _offset, String *write_str) {
         size_t new_length = _offset + write_str->length;
         if (new_length > size) {
-            reserve(swoole_size_align(new_length * 2, SwooleG.pagesize));
+            reserve(swoole_size_align(new_length * 2, swoole_pagesize()));
         }
 
         memcpy(str + _offset, write_str->str, write_str->length);
@@ -231,16 +248,23 @@ class String {
         }
     }
 
-    inline void write(off_t _offset, const char *write_str, size_t _length) {
+    void write(off_t _offset, const char *write_str, size_t _length) {
         size_t new_length = _offset + _length;
         if (new_length > size) {
-            reserve(swoole_size_align(new_length * 2, SwooleG.pagesize));
+            reserve(swoole_size_align(new_length * 2, swoole_pagesize()));
         }
 
         memcpy(str + _offset, write_str, _length);
         if (new_length > length) {
             length = new_length;
         }
+    }
+
+    void set_null_terminated() {
+        if (length == size) {
+            extend(length + 1);
+        }
+        str[length] = '\0';
     }
 
     int append(int value);
@@ -255,7 +279,7 @@ class String {
     };
 
     template <typename... Args>
-    inline size_t format_impl(int flags, const char *format, Args... args) {
+    size_t format_impl(int flags, const char *format, Args... args) {
         size_t _size = sw_snprintf(nullptr, 0, format, args...);
         if (_size == 0) {
             return 0;
@@ -291,7 +315,7 @@ class String {
     }
 
     template <typename... Args>
-    inline size_t format(const char *format, Args... args) {
+    size_t format(const char *format, Args... args) {
         return format_impl(0, format, args...);
     }
 

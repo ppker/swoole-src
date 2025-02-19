@@ -53,8 +53,7 @@ bool ListenPort::ssl_add_sni_cert(const std::string &name, SSLContext *ctx) {
     return true;
 }
 
-static bool ssl_matches_wildcard_name(const char *subjectname, const char *certname) /* {{{ */
-{
+static bool ssl_matches_wildcard_name(const char *subjectname, const char *certname) {
     const char *wildcard = NULL;
     ptrdiff_t prefix_len;
     size_t suffix_len, subject_len;
@@ -143,7 +142,7 @@ bool ListenPort::ssl_create_context(SSLContext *context) {
         context->http_v2 = 1;
     }
     if (!context->create()) {
-        swoole_warning("swSSL_get_context() error");
+        swoole_warning("failed to create ssl content");
         return false;
     }
     return true;
@@ -232,7 +231,6 @@ void Server::init_port_protocol(ListenPort *ls) {
         ls->protocol.onPackage = Server::dispatch_task;
         ls->onRead = Port_onRead_check_length;
     } else if (ls->open_http_protocol) {
-#ifdef SW_USE_HTTP2
         if (ls->open_http2_protocol && ls->open_websocket_protocol) {
             ls->protocol.get_package_length = http_server::get_package_length;
             ls->protocol.get_package_length_size = http_server::get_package_length_size;
@@ -241,10 +239,8 @@ void Server::init_port_protocol(ListenPort *ls) {
             ls->protocol.package_length_size = SW_HTTP2_FRAME_HEADER_SIZE;
             ls->protocol.get_package_length = http2::get_frame_length;
             ls->protocol.onPackage = Server::dispatch_task;
-        } else
-#endif
-            if (ls->open_websocket_protocol) {
-            ls->protocol.package_length_size = SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_MASK_LEN + sizeof(uint64_t);
+        } else if (ls->open_websocket_protocol) {
+            ls->protocol.package_length_size = SW_WEBSOCKET_MESSAGE_HEADER_SIZE;
             ls->protocol.get_package_length = websocket::get_package_length;
             ls->protocol.onPackage = websocket::dispatch_frame;
         }
@@ -299,9 +295,7 @@ void ListenPort::clear_protocol() {
     open_length_check = 0;
     open_http_protocol = 0;
     open_websocket_protocol = 0;
-#ifdef SW_USE_HTTP2
     open_http2_protocol = 0;
-#endif
     open_mqtt_protocol = 0;
     open_redis_protocol = 0;
 }
@@ -393,11 +387,9 @@ static int Port_onRead_http(Reactor *reactor, ListenPort *port, Event *event) {
         return Port_onRead_check_length(reactor, port, event);
     }
 
-#ifdef SW_USE_HTTP2
     if (conn->http2_stream) {
         return Port_onRead_check_length(reactor, port, event);
     }
-#endif
 
     Request *request = nullptr;
     Protocol *protocol = &port->protocol;
@@ -474,15 +466,12 @@ _parse:
                          CLIENT_INFO_ARGS);
         goto _bad_request;
     } else if (request->method == SW_HTTP_PRI) {
-#ifdef SW_USE_HTTP2
         if (sw_unlikely(!port->open_http2_protocol)) {
-#endif
             swoole_error_log(SW_LOG_TRACE,
                              SW_ERROR_HTTP_INVALID_PROTOCOL,
                              "Bad Request: can not handle HTTP2 request" CLIENT_INFO_FMT,
                              CLIENT_INFO_ARGS);
             goto _bad_request;
-#ifdef SW_USE_HTTP2
         }
         conn->http2_stream = 1;
         http2::send_setting_frame(protocol, _socket);
@@ -495,7 +484,6 @@ _parse:
         serv->destroy_http_request(conn);
         conn->socket->skip_recv = 1;
         return Port_onRead_check_length(reactor, port, event);
-#endif
     }
 
     // http header is not the end
@@ -515,18 +503,50 @@ _parse:
     // parse http header and got http body length
     if (!request->header_parsed) {
         request->parse_header_info();
+        request->max_length_ = protocol->package_max_length;
         swoole_trace_log(SW_TRACE_SERVER,
                          "content-length=%" PRIu64 ", keep-alive=%u, chunked=%u",
                          request->content_length_,
                          request->keep_alive,
                          request->chunked);
+        if (request->form_data_) {
+            if (serv->upload_max_filesize > 0 &&
+                request->header_length_ + request->content_length_ > request->max_length_) {
+                request->init_multipart_parser(serv);
+
+                buffer = request->buffer_;
+            } else {
+                delete request->form_data_;
+                request->form_data_ = nullptr;
+            }
+        }
+    }
+
+    if (request->form_data_) {
+        if (!request->multipart_header_parsed && memmem(buffer->str, buffer->length, SW_STRL("\r\n\r\n")) == nullptr) {
+            return SW_OK;
+        }
+        if (!request->parse_multipart_data(buffer)) {
+            goto _bad_request;
+        }
+        if (request->too_large) {
+            goto _too_large;
+        }
+        if (request->unavailable) {
+            goto _unavailable;
+        }
+        if (!request->tried_to_dispatch) {
+            return SW_OK;
+        }
+        request->destroy_multipart_parser();
+        buffer = request->buffer_;
     }
 
     // content length (equal to 0) or (field not found but not chunked)
     if (!request->tried_to_dispatch) {
         // recv nobody_chunked eof
         if (request->nobody_chunked) {
-            if (buffer->length < request->header_length_ + (sizeof("0\r\n\r\n") - 1)) {
+            if (buffer->length < request->header_length_ + (sizeof(SW_HTTP_CHUNK_EOF) - 1)) {
                 goto _recv_data;
             }
             request->header_length_ += (sizeof("0\r\n\r\n") - 1);
@@ -591,13 +611,15 @@ _parse:
         } else {
             request_length = request->header_length_ + request->content_length_;
         }
-        swoole_trace_log(SW_TRACE_SERVER, "received chunked eof, real content-length=%" PRIu64, request->content_length_);
+        swoole_trace_log(
+            SW_TRACE_SERVER, "received chunked eof, real content-length=%" PRIu64, request->content_length_);
     } else {
         request_length = request->header_length_ + request->content_length_;
         if (request_length > protocol->package_max_length) {
             swoole_error_log(SW_LOG_WARNING,
                              SW_ERROR_HTTP_INVALID_PROTOCOL,
-                             "Request Entity Too Large: header-length (%u) + content-length (%" PRIu64 ") is greater than the "
+                             "Request Entity Too Large: header-length (%u) + content-length (%" PRIu64
+                             ") is greater than the "
                              "package_max_length(%u)" CLIENT_INFO_FMT,
                              request->header_length_,
                              request->content_length_,
@@ -740,14 +762,11 @@ const char *ListenPort::get_protocols() {
     } else if (open_length_check) {
         return "length";
     } else if (open_http_protocol) {
-#ifdef SW_USE_HTTP2
         if (open_http2_protocol && open_websocket_protocol) {
             return "http|http2|websocket";
         } else if (open_http2_protocol) {
             return "http|http2";
-        } else
-#endif
-            if (open_websocket_protocol) {
+        } else if (open_websocket_protocol) {
             return "http|websocket";
         } else {
             return "http";
@@ -759,6 +778,70 @@ const char *ListenPort::get_protocols() {
     } else {
         return "raw";
     }
+}
+
+size_t ListenPort::get_connection_num() const {
+    if (gs->connection_nums) {
+        size_t num = 0;
+        for (uint32_t i = 0; i < sw_server()->worker_num; i++) {
+            num += gs->connection_nums[i];
+        }
+        return num;
+    } else {
+        return gs->connection_num;
+    }
+}
+
+int ListenPort::create_socket(Server *server) {
+    if (socket) {
+#if defined(__linux__) && defined(HAVE_REUSEPORT)
+        if (server->enable_reuse_port) {
+            close_socket();
+        } else
+#endif
+        {
+            return SW_OK;
+        }
+    }
+
+    socket = make_socket(
+        type, is_dgram() ? SW_FD_DGRAM_SERVER : SW_FD_STREAM_SERVER, SW_SOCK_CLOEXEC | SW_SOCK_NONBLOCK);
+    if (socket == nullptr) {
+        swoole_set_last_error(errno);
+        return SW_ERR;
+    }
+
+#if defined(SW_SUPPORT_DTLS) && defined(HAVE_KQUEUE)
+    if (is_dtls()) {
+        socket->set_reuse_port();
+    }
+#endif
+
+#if defined(__linux__) && defined(HAVE_REUSEPORT)
+    if (server->enable_reuse_port) {
+        if (socket->set_reuse_port() < 0) {
+            socket->free();
+            return SW_ERR;
+        }
+    }
+#endif
+
+    if (socket->bind(host, &port) < 0) {
+        swoole_set_last_error(errno);
+        socket->free();
+        return SW_ERR;
+    }
+
+    socket->info.assign(type, host, port);
+    return SW_OK;
+}
+
+void ListenPort::close_socket() {
+    if (::close(socket->fd) < 0) {
+        swoole_sys_warning("close(%d) failed", socket->fd);
+    }
+    delete socket;
+    socket = nullptr;
 }
 
 }  // namespace swoole

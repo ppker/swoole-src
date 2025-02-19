@@ -103,19 +103,16 @@ int Socket::sendfile_blocking(const char *filename, off_t offset, size_t length,
         length = offset + length;
     }
 
-    int n, sendn;
+    ssize_t n, sent_bytes;
     while (offset < (off_t) length) {
         if (wait_event(timeout_ms, SW_EVENT_WRITE) < 0) {
             return SW_ERR;
-        } else {
-            sendn = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
-            n = ::swoole_sendfile(fd, file.get_fd(), &offset, sendn);
-            if (n <= 0) {
-                swoole_sys_warning("sendfile(%d, %s) failed", fd, filename);
-                return SW_ERR;
-            } else {
-                continue;
-            }
+        }
+        sent_bytes = (length - offset > SW_SENDFILE_CHUNK_SIZE) ? SW_SENDFILE_CHUNK_SIZE : length - offset;
+        n = ::swoole_sendfile(fd, file.get_fd(), &offset, sent_bytes);
+        if (n <= 0) {
+            swoole_sys_warning("sendfile(%d, %s) failed", fd, filename);
+            return SW_ERR;
         }
     }
     return SW_OK;
@@ -173,9 +170,14 @@ int Socket::wait_event(int timeout_ms, int events) {
         if (ret == 0) {
             swoole_set_last_error(SW_ERROR_SOCKET_POLL_TIMEOUT);
             return SW_ERR;
-        } else if (ret < 0 && errno != EINTR) {
-            swoole_sys_warning("poll() failed");
-            return SW_ERR;
+        } else if (ret < 0) {
+            if (errno != EINTR) {
+                swoole_sys_warning("poll() failed");
+            } else if (dont_restart) {
+                return SW_ERR;
+            } else {
+                continue;
+            }
         } else {
             return SW_OK;
         }
@@ -418,7 +420,7 @@ bool Socket::set_buffer_size(uint32_t _buffer_size) {
 
 bool Socket::set_recv_buffer_size(uint32_t _buffer_size) {
     if (set_option(SOL_SOCKET, SO_RCVBUF, _buffer_size) != 0) {
-        swoole_sys_warning("setsockopt(%d, SOL_SOCKET, SO_SNDBUF, %d) failed", fd, _buffer_size);
+        swoole_sys_warning("setsockopt(%d, SOL_SOCKET, SO_RCVBUF, %d) failed", fd, _buffer_size);
         return false;
     }
     return true;
@@ -426,7 +428,7 @@ bool Socket::set_recv_buffer_size(uint32_t _buffer_size) {
 
 bool Socket::set_send_buffer_size(uint32_t _buffer_size) {
     if (set_option(SOL_SOCKET, SO_SNDBUF, _buffer_size) != 0) {
-        swoole_sys_warning("setsockopt(%d, SOL_SOCKET, SO_RCVBUF, %d) failed", fd, _buffer_size);
+        swoole_sys_warning("setsockopt(%d, SOL_SOCKET, SO_SNDBUF, %d) failed", fd, _buffer_size);
         return false;
     }
     return true;
@@ -434,6 +436,13 @@ bool Socket::set_send_buffer_size(uint32_t _buffer_size) {
 
 bool Socket::set_timeout(double timeout) {
     return set_recv_timeout(timeout) and set_send_timeout(timeout);
+}
+
+Socket *Socket::dup() {
+    Socket *_socket = new Socket();
+    *_socket = *this;
+    _socket->fd = ::dup(fd);
+    return _socket;
 }
 
 static bool _set_timeout(int fd, int type, double timeout) {
@@ -540,7 +549,7 @@ int Socket::handle_sendfile() {
     int ret;
     Buffer *buffer = out_buffer;
     BufferChunk *chunk = buffer->front();
-    SendfileRequest *task = (SendfileRequest *) chunk->value.object;
+    SendfileRequest *task = (SendfileRequest *) chunk->value.ptr;
 
     if (task->offset == 0) {
         cork();
@@ -604,7 +613,7 @@ int Socket::handle_send() {
         return SW_OK;
     }
 
-    ssize_t ret = send(chunk->value.ptr + chunk->offset, sendn, 0);
+    ssize_t ret = send(chunk->value.str + chunk->offset, sendn, 0);
     if (ret < 0) {
         switch (catch_write_error(errno)) {
         case SW_ERROR:
@@ -636,7 +645,7 @@ int Socket::handle_send() {
 }
 
 static void Socket_sendfile_destructor(BufferChunk *chunk) {
-    SendfileRequest *task = (SendfileRequest *) chunk->value.object;
+    SendfileRequest *task = (SendfileRequest *) chunk->value.ptr;
     delete task;
 }
 
@@ -676,7 +685,7 @@ int Socket::sendfile(const char *filename, off_t offset, size_t length) {
     }
 
     BufferChunk *chunk = out_buffer->alloc(BufferChunk::TYPE_SENDFILE, 0);
-    chunk->value.object = task.release();
+    chunk->value.ptr = task.release();
     chunk->destroy = Socket_sendfile_destructor;
 
     return SW_OK;
@@ -758,6 +767,28 @@ ssize_t Socket::send_async(const void *__buf, size_t __n) {
         return send_blocking(__buf, __n);
     } else {
         return swoole_event_write(this, __buf, __n);
+    }
+}
+
+ssize_t Socket::read_sync(void *__buf, size_t __len, int timeout_ms) {
+    struct pollfd event;
+    event.fd = fd;
+    event.events = POLLIN;
+    if (poll(&event, 1, timeout_ms) == 1) {
+        return read(__buf, __len);
+    } else {
+        return -1;
+    }
+}
+
+ssize_t Socket::write_sync(const void *__buf, size_t __len, int timeout_ms) {
+    struct pollfd event;
+    event.fd = fd;
+    event.events = POLLOUT;
+    if (poll(&event, 1, timeout_ms) == 1) {
+        return write(__buf, __len);
+    } else {
+        return -1;
     }
 }
 
@@ -1167,7 +1198,7 @@ int Socket::ssl_connect() {
     return SW_ERR;
 }
 
-int Socket::ssl_sendfile(const File &fp, off_t *_offset, size_t _size) {
+ssize_t Socket::ssl_sendfile(const File &fp, off_t *_offset, size_t _size) {
     char buf[SW_BUFFER_SIZE_BIG];
     ssize_t readn = _size > sizeof(buf) ? sizeof(buf) : _size;
 
@@ -1338,8 +1369,7 @@ ssize_t Socket::ssl_recv(void *__buf, size_t __n) {
             return SW_ERR;
 
         case SSL_ERROR_SYSCALL:
-            errno = SW_ERROR_SSL_RESET;
-            return SW_ERR;
+            return errno == 0 ? 0 : SW_ERR;
 
         case SSL_ERROR_SSL:
             ssl_catch_error();
@@ -1460,9 +1490,28 @@ Socket *make_socket(SocketType type, FdType fd_type, int flags) {
     if (Socket::get_domain_and_type(type, &sock_domain, &sock_type) < 0) {
         swoole_warning("unknown socket type [%d]", type);
         errno = ESOCKTNOSUPPORT;
+        swoole_set_last_error(errno);
         return nullptr;
     }
 
+    return make_socket(type, fd_type, sock_domain, sock_type, 0, flags);
+}
+
+Socket *make_socket(SocketType type, FdType fd_type, int sock_domain, int sock_type, int socket_protocol, int flags) {
+    int sockfd = swoole::socket(sock_domain, sock_type, socket_protocol, flags);
+    if (sockfd < 0) {
+        swoole_set_last_error(errno);
+        return nullptr;
+    }
+
+    auto _socket = swoole::make_socket(sockfd, fd_type);
+    _socket->nonblock = !!(flags & SW_SOCK_NONBLOCK);
+    _socket->cloexec = !!(flags & SW_SOCK_CLOEXEC);
+    _socket->socket_type = type;
+    return _socket;
+}
+
+int socket(int sock_domain, int sock_type, int socket_protocol, int flags) {
     bool nonblock = flags & SW_SOCK_NONBLOCK;
     bool cloexec = flags & SW_SOCK_CLOEXEC;
 
@@ -1474,27 +1523,23 @@ Socket *make_socket(SocketType type, FdType fd_type, int flags) {
     if (cloexec) {
         sock_flags |= SOCK_CLOEXEC;
     }
-    int sockfd = socket(sock_domain, sock_type | sock_flags, 0);
+    int sockfd = ::socket(sock_domain, sock_type | sock_flags, socket_protocol);
     if (sockfd < 0) {
-        return nullptr;
+        return sockfd;
     }
 #else
-    int sockfd = socket(sock_domain, sock_type, 0);
+    int sockfd = ::socket(sock_domain, sock_type, socket_protocol);
     if (sockfd < 0) {
-        return nullptr;
+        return sockfd;
     }
     if (nonblock || cloexec) {
         if (!network::_fcntl_set_option(sockfd, nonblock ? 1 : -1, cloexec ? 1 : -1)) {
             close(sockfd);
-            return nullptr;
+            return sockfd;
         }
     }
 #endif
-    auto _socket = swoole::make_socket(sockfd, fd_type);
-    _socket->nonblock = nonblock;
-    _socket->cloexec = cloexec;
-    _socket->socket_type = type;
-    return _socket;
+    return sockfd;
 }
 
 Socket *make_server_socket(SocketType type, const char *address, int port, int backlog) {

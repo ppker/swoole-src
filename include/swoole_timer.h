@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -62,11 +62,12 @@ class Timer {
     /*---------------event timer--------------*/
     struct timeval base_time;
     /*----------------------------------------*/
-    int (*set)(Timer *timer, long exec_msec) = nullptr;
-    void (*close)(Timer *timer) = nullptr;
+    std::function<int(Timer *timer, long exec_msec)> set;
+    std::function<void(Timer *timer)> close;
 
-    bool init_reactor(Reactor *reactor);
-    bool init_system_timer();
+    bool init_with_reactor(Reactor *reactor);
+    bool init_with_user_scheduler(const TimerScheduler &scheduler);
+    bool init_with_system_timer();
 
   public:
     long next_msec_;
@@ -75,7 +76,7 @@ class Timer {
     ~Timer();
     static int now(struct timeval *time);
 
-    inline int64_t get_relative_msec() {
+    int64_t get_relative_msec() {
         struct timeval _now;
         if (now(&_now) < 0) {
             return SW_ERR;
@@ -95,7 +96,7 @@ class Timer {
         return msec1 + msec2;
     }
 
-    inline Reactor *get_reactor() {
+    Reactor *get_reactor() {
         return reactor_;
     }
 
@@ -113,7 +114,7 @@ class Timer {
     void reinit(Reactor *reactor);
     int select();
 
-    inline TimerNode *get(long id) {
+    TimerNode *get(long id) {
         auto it = map.find(id);
         if (it == map.end()) {
             return nullptr;
@@ -122,24 +123,24 @@ class Timer {
         }
     }
 
-    inline TimerNode *get(long id, const enum TimerNode::Type type) {
+    TimerNode *get(long id, const enum TimerNode::Type type) {
         TimerNode *tnode = get(id);
         return (tnode && tnode->type == type) ? tnode : nullptr;
     }
 
-    inline size_t count() {
+    size_t count() {
         return map.size();
     }
 
-    inline uint64_t get_round() {
+    uint64_t get_round() {
         return round;
     }
 
-    inline bool remove(long id) {
+    bool remove(long id) {
         return remove(get(id));
     }
 
-    inline const std::unordered_map<long, TimerNode *> &get_map() {
+    const std::unordered_map<long, TimerNode *> &get_map() {
         return map;
     }
 };

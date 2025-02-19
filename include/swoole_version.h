@@ -10,7 +10,7 @@
   | to obtain it through the world-wide-web, please send a note to       |
   | license@swoole.com so we can mail you a copy immediately.            |
   +----------------------------------------------------------------------+
-  | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+  | Author: Tianfeng Han  <rango@swoole.com>                             |
   |         Twosee  <twose@qq.com>                                       |
   +----------------------------------------------------------------------+
 */
@@ -18,13 +18,13 @@
 #ifndef SWOOLE_VERSION_H_
 #define SWOOLE_VERSION_H_
 
-#define SWOOLE_MAJOR_VERSION 5
+#define SWOOLE_MAJOR_VERSION 6
 #define SWOOLE_MINOR_VERSION 0
-#define SWOOLE_RELEASE_VERSION 0
+#define SWOOLE_RELEASE_VERSION 2
 #define SWOOLE_EXTRA_VERSION "dev"
-#define SWOOLE_VERSION "5.0.0-dev"
-#define SWOOLE_VERSION_ID 50000
-#define SWOOLE_API_VERSION_ID 0x202201a
+#define SWOOLE_VERSION "6.0.2-dev"
+#define SWOOLE_VERSION_ID 60002
+#define SWOOLE_API_VERSION_ID 0x202208a
 
 #define SWOOLE_BUG_REPORT                                                                                              \
     "A bug occurred in Swoole-v" SWOOLE_VERSION ", please report it.\n"                                                \

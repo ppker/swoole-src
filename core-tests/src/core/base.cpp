@@ -13,7 +13,7 @@
   | @link     https://www.swoole.com/                                    |
   | @contact  team@swoole.com                                            |
   | @license  https://github.com/swoole/swoole-src/blob/master/LICENSE   |
-  | @author   Tianfeng Han  <mikan.tenny@gmail.com>                      |
+  | @Author   Tianfeng Han  <rango@swoole.com>                           |
   +----------------------------------------------------------------------+
 */
 
@@ -76,7 +76,7 @@ TEST(base, file_get_size) {
 
     ASSERT_TRUE(f.ready());
     f.truncate(0);
-    f.set_offest(0);
+    f.set_offset(0);
     f.write(buf, sizeof(buf) - 1);
     f.close();
 
@@ -221,17 +221,6 @@ TEST(base, version) {
 
 static std::string test_func(std::string test_data_2) {
     return test_data + test_data_2;
-}
-
-TEST(base, add_function) {
-    typedef std::string (*_func_t)(std::string);
-    swoole_add_function("test_func", (void *) test_func);
-    ASSERT_EQ(swoole_add_function("test_func", (void *) test_func), SW_ERR);
-    _func_t _func = (_func_t) swoole_get_function(SW_STRL("test_func"));
-    std::string b = ", swoole is best";
-    auto rs = _func(", swoole is best");
-    ASSERT_EQ(rs, test_data + b);
-    ASSERT_EQ(swoole_get_function(SW_STRL("test_func31")), nullptr);
 }
 
 TEST(base, hook) {

@@ -21,13 +21,10 @@ $pm->parentFunc = function () use ($pm) {
 
     $post_data = array('test' => str_repeat('a', 80));
 
-    if (function_exists("curl_file_create"))
-    {
+    if (function_exists("curl_file_create")) {
         $cfile = curl_file_create($file);
         $post_data['file'] = $cfile;
-    }
-    else
-    {
+    } else {
         $post_data['file'] = '@' . $file;
     }
 
@@ -45,7 +42,7 @@ $pm->childFunc = function () use ($pm) {
     $http = new Swoole\Http\Server('127.0.0.1', $pm->getFreePort(), SWOOLE_BASE);
 
     $http->set([
-        'log_file' => '/dev/null'
+        'log_file' => '/dev/null',
     ]);
 
     $http->on("WorkerStart", function () use ($pm) {

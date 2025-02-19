@@ -12,7 +12,7 @@
  | to obtain it through the world-wide-web, please send a note to       |
  | license@swoole.com so we can mail you a copy immediately.            |
  +----------------------------------------------------------------------+
- | Author: Tianfeng Han  <mikan.tenny@gmail.com>                        |
+ | Author: Tianfeng Han  <rango@swoole.com>                             |
  +----------------------------------------------------------------------+
  */
 
@@ -29,8 +29,36 @@ SW_EXTERN_C_BEGIN
 
 typedef void *fcontext_t;
 
-intptr_t swoole_jump_fcontext(fcontext_t *ofc, fcontext_t nfc, intptr_t vp, bool preserve_fpu = false);
-fcontext_t swoole_make_fcontext(void *sp, size_t size, void (*fn)(intptr_t));
+struct transfer_t {
+    fcontext_t  fctx;
+    void    *   data;
+};
+
+#ifdef __GNUC__
+#define SW_GCC_VERSION (__GNUC__ * 1000 + __GNUC_MINOR__)
+#else
+#define SW_GCC_VERSION 0
+#endif
+
+#if defined(__GNUC__) && SW_GCC_VERSION >= 9000
+#define SW_INDIRECT_RETURN __attribute__((__indirect_return__))
+#else
+#define SW_INDIRECT_RETURN
+#endif
+
+#undef SWOOLE_CONTEXT_CALLDECL
+#if (defined(i386) || defined(__i386__) || defined(__i386) \
+     || defined(__i486__) || defined(__i586__) || defined(__i686__) \
+     || defined(__X86__) || defined(_X86_) || defined(__THW_INTEL__) \
+     || defined(__I86__) || defined(__INTEL__) || defined(__IA32__) \
+     || defined(_M_IX86) || defined(_I86_)) && defined(BOOST_WINDOWS)
+# define SWOOLE_CONTEXT_CALLDECL __cdecl
+#else
+# define SWOOLE_CONTEXT_CALLDECL
+#endif
+
+transfer_t SWOOLE_CONTEXT_CALLDECL swoole_jump_fcontext(fcontext_t const to, void * vp);
+fcontext_t SWOOLE_CONTEXT_CALLDECL swoole_make_fcontext(void *stack, size_t stack_size, void (* fn)(transfer_t));
 
 SW_EXTERN_C_END
 

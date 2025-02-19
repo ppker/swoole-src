@@ -148,7 +148,7 @@ static std::string handle_get_all_sockets(Server *, const std::string &msg) {
 
 static std::string handle_get_all_commands(Server *serv, const std::string &msg) {
     json command_list = json::array();
-    for (auto kv : serv->commands) {
+    for (auto &kv : serv->commands) {
         json info = json::object({
             {"id", kv.second.id},
             {"name", kv.second.name},
@@ -165,7 +165,7 @@ static std::string handle_get_all_commands(Server *serv, const std::string &msg)
 
 #ifdef TCP_INFO
 static json get_socket_info(int fd) {
-    struct tcp_info info;
+    tcp_info info;
     socklen_t len = sizeof(info);
     if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) < 0) {
         json return_value{
@@ -174,40 +174,12 @@ static json get_socket_info(int fd) {
         };
         return return_value.dump();
     }
-    json jinfo{
-        {"state", info.tcpi_state},
-        {"ca_state", info.tcpi_ca_state},
-        {"retransmits", info.tcpi_retransmits},
-        {"probes", info.tcpi_probes},
-        {"backoff", info.tcpi_backoff},
-        {"options", info.tcpi_options},
-        {"snd_wscale", uint8_t(info.tcpi_snd_wscale)},
-        {"rcv_wscale", uint8_t(info.tcpi_rcv_wscale)},
-        {"rto", info.tcpi_rto},
-        {"ato", info.tcpi_ato},
-        {"snd_mss", info.tcpi_snd_mss},
-        {"rcv_mss", info.tcpi_rcv_mss},
-        {"unacked", info.tcpi_unacked},
-        {"sacked", info.tcpi_sacked},
-        {"lost", info.tcpi_lost},
-        {"retrans", info.tcpi_retrans},
-        {"fackets", info.tcpi_fackets},
-        {"last_data_sent", info.tcpi_last_data_sent},
-        {"last_ack_sent", info.tcpi_last_ack_sent},
-        {"last_data_recv", info.tcpi_last_data_recv},
-        {"last_ack_recv", info.tcpi_last_ack_recv},
-        {"pmtu", info.tcpi_pmtu},
-        {"rcv_ssthresh", info.tcpi_rcv_ssthresh},
-        {"rtt", info.tcpi_rtt},
-        {"rttvar", info.tcpi_rttvar},
-        {"snd_ssthresh", info.tcpi_snd_ssthresh},
-        {"snd_cwnd", info.tcpi_snd_cwnd},
-        {"advmss", info.tcpi_advmss},
-        {"reordering", info.tcpi_reordering},
-        {"rcv_rtt", info.tcpi_rcv_rtt},
-        {"rcv_space", info.tcpi_rcv_space},
-        {"total_retrans", info.tcpi_total_retrans},
-    };
+
+    auto info_map = sw_socket_parse_tcp_info(&info);
+    json jinfo;
+    for (const auto &iter : info_map) {
+        jinfo[iter.first] = iter.second;
+    }
     return jinfo;
 }
 #endif
@@ -299,7 +271,7 @@ static size_t get_socket_out_buffer_total_size() {
         return 0;
     }
     size_t size = 0;
-    for (auto s : sw_reactor()->get_sockets()) {
+    for (auto &s : sw_reactor()->get_sockets()) {
         if (s.second->out_buffer) {
             size += s.second->out_buffer->length();
         }
@@ -323,13 +295,6 @@ static std::string handle_get_memory_info(Server *serv, const std::string &msg) 
         {"socket_list", sw_reactor() ? sw_reactor()->get_sockets().size() * sizeof(network::Socket) : 0},
         {"socket_out_buffer", get_socket_out_buffer_total_size()},
         {"php_memory", is_thread ? 0 : zend_memory_usage(true)},
-        {"http_buffer", swoole_http_buffer ? swoole_http_buffer->size : 0},
-        {"http_form_data_buffer", swoole_http_form_data_buffer ? swoole_http_form_data_buffer->size : 0},
-#ifdef SW_HAVE_COMPRESSION
-        {"zlib_buffer", swoole_zlib_buffer ? swoole_zlib_buffer->size : 0},
-#else
-        {"zlib_buffer", 0},
-#endif
     };
     json return_value{
         {"data", jinfo},
@@ -344,7 +309,7 @@ static std::string handle_get_connections(Server *serv, const std::string &msg) 
         if (serv->is_process_mode() && conn->reactor_id != SwooleTG.id) {
             return;
         }
-        if (serv->is_base_mode() && SwooleWG.worker && conn->reactor_id != SwooleWG.worker->id) {
+        if (serv->is_base_mode() && sw_worker() && conn->reactor_id != sw_worker()->id) {
             return;
         }
         list.push_back(get_connection_info(serv, conn));
@@ -394,7 +359,7 @@ static std::string handle_get_all_ports(Server *serv, const std::string &msg) {
             {"type", port->type},
             {"ssl", port->ssl},
             {"protocols", port->get_protocols()},
-            {"connection_num", (long) port->gs->connection_num},
+            {"connection_num", (long) port->get_connection_num()},
         });
         _list.push_back(info);
     };
@@ -447,6 +412,150 @@ static uint32_t object_store_count() {
     objects_store_foreach([&count](zend_object *obj) { count++; });
     return count;
 }
+
+#ifdef TCP_INFO
+// clang-format off
+std::unordered_map<std::string, uint64_t> sw_socket_parse_tcp_info(tcp_info *info) {
+#if defined(__FreeBSD__) || defined(__NetBSD__)
+    return {
+        {"state", info->tcpi_state},
+        {"ca_state", info->__tcpi_ca_state},
+        {"retransmits", info->__tcpi_retransmits},
+        {"probes", info->__tcpi_probes},
+        {"backoff", info->__tcpi_backoff},
+        {"options", info->tcpi_options},
+        {"snd_wscale", uint8_t(info->tcpi_snd_wscale)},
+        {"rcv_wscale", uint8_t(info->tcpi_rcv_wscale)},
+        {"rto", info->tcpi_rto},
+        {"ato", info->__tcpi_ato},
+        {"snd_mss", info->tcpi_snd_mss},
+        {"rcv_mss", info->tcpi_rcv_mss},
+        {"unacked", info->__tcpi_unacked},
+        {"sacked", info->__tcpi_sacked},
+        {"lost", info->__tcpi_lost},
+        {"retrans", info->__tcpi_retrans},
+        {"fackets", info->__tcpi_fackets},
+        {"last_data_sent", info->__tcpi_last_data_sent},
+        {"last_ack_sent", info->__tcpi_last_ack_sent},
+        {"last_data_recv", info->tcpi_last_data_recv},
+        {"last_ack_recv", info->__tcpi_last_ack_recv},
+        {"pmtu", info->__tcpi_pmtu},
+        {"rcv_ssthresh", info->__tcpi_rcv_ssthresh},
+        {"rtt", info->tcpi_rtt},
+        {"rttvar", info->tcpi_rttvar},
+        {"snd_ssthresh", info->tcpi_snd_ssthresh},
+        {"snd_cwnd", info->tcpi_snd_cwnd},
+        {"advmss", info->__tcpi_advmss},
+        {"reordering", info->__tcpi_reordering},
+        {"rcv_rtt", info->__tcpi_rcv_rtt},
+        {"rcv_space", info->tcpi_rcv_space},
+        {"snd_wnd", info->tcpi_snd_wnd},
+        {"snd_nxt", info->tcpi_snd_nxt},
+        {"rcv_nxt", info->tcpi_rcv_nxt},
+        {"toe_tid", info->tcpi_toe_tid},
+        {"total_retrans", info->tcpi_snd_rexmitpack},
+        {"rcv_ooopack", info->tcpi_rcv_ooopack},
+        {"snd_zerowin", info->tcpi_snd_zerowin},
+    };
+#elif defined(__OpenBSD__)
+    return {
+        {"state", info->tcpi_state},
+        {"ca_state", info->__tcpi_ca_state},
+        {"retransmits", info->__tcpi_retransmits},
+        {"probes", info->__tcpi_probes},
+        {"backoff", info->__tcpi_backoff},
+        {"options", info->tcpi_options},
+        {"snd_wscale", uint8_t(info->tcpi_snd_wscale)},
+        {"rcv_wscale", uint8_t(info->tcpi_rcv_wscale)},
+        {"rto", info->tcpi_rto},
+        {"ato", info->__tcpi_ato},
+        {"snd_mss", info->tcpi_snd_mss},
+        {"rcv_mss", info->tcpi_rcv_mss},
+        {"unacked", info->__tcpi_unacked},
+        {"sacked", info->__tcpi_sacked},
+        {"lost", info->__tcpi_lost},
+        {"retrans", info->__tcpi_retrans},
+        {"fackets", info->__tcpi_fackets},
+        {"last_data_sent", info->tcpi_last_data_sent},
+        {"last_ack_sent", info->tcpi_last_ack_sent},
+        {"last_data_recv", info->tcpi_last_data_recv},
+        {"last_ack_recv", info->tcpi_last_ack_recv},
+        {"pmtu", info->__tcpi_pmtu},
+        {"rcv_ssthresh", info->__tcpi_rcv_ssthresh},
+        {"rtt", info->tcpi_rtt},
+        {"rttvar", info->tcpi_rttvar},
+        {"snd_ssthresh", info->tcpi_snd_ssthresh},
+        {"snd_cwnd", info->tcpi_snd_cwnd},
+        {"advmss", info->__tcpi_advmss},
+        {"reordering", info->__tcpi_reordering},
+        {"rcv_rtt", info->__tcpi_rcv_rtt},
+        {"rcv_space", info->tcpi_rcv_space},
+        {"snd_wnd", info->tcpi_snd_wnd},
+        {"snd_nxt", info->tcpi_snd_nxt},
+        {"rcv_nxt", info->tcpi_rcv_nxt},
+        {"toe_tid", info->tcpi_toe_tid},
+        {"total_retrans", info->tcpi_snd_rexmitpack},
+        {"rcv_ooopack", info->tcpi_rcv_ooopack},
+        {"snd_zerowin", info->tcpi_snd_zerowin},
+    };
+#elif defined(__linux__)
+    return {
+        {"state", info->tcpi_state},
+        {"ca_state", info->tcpi_ca_state},
+        {"retransmits", info->tcpi_retransmits},
+        {"probes", info->tcpi_probes},
+        {"backoff", info->tcpi_backoff},
+        {"options", info->tcpi_options},
+        {"snd_wscale", uint8_t(info->tcpi_snd_wscale)},
+        {"rcv_wscale", uint8_t(info->tcpi_rcv_wscale)},
+        {"rto", info->tcpi_rto},
+        {"ato", info->tcpi_ato},
+        {"snd_mss", info->tcpi_snd_mss},
+        {"rcv_mss", info->tcpi_rcv_mss},
+        {"unacked", info->tcpi_unacked},
+        {"sacked", info->tcpi_sacked},
+        {"lost", info->tcpi_lost},
+        {"retrans", info->tcpi_retrans},
+        {"fackets", info->tcpi_fackets},
+        {"last_data_sent", info->tcpi_last_data_sent},
+        {"last_ack_sent", info->tcpi_last_ack_sent},
+        {"last_data_recv", info->tcpi_last_data_recv},
+        {"last_ack_recv", info->tcpi_last_ack_recv},
+        {"pmtu", info->tcpi_pmtu},
+        {"rcv_ssthresh", info->tcpi_rcv_ssthresh},
+        {"rtt", info->tcpi_rtt},
+        {"rttvar", info->tcpi_rttvar},
+        {"snd_ssthresh", info->tcpi_snd_ssthresh},
+        {"snd_cwnd", info->tcpi_snd_cwnd},
+        {"advmss", info->tcpi_advmss},
+        {"reordering", info->tcpi_reordering},
+        {"rcv_rtt", info->tcpi_rcv_rtt},
+        {"rcv_space", info->tcpi_rcv_space},
+        {"total_retrans", info->tcpi_total_retrans},
+    };
+#elif defined(__APPLE__)
+    return {
+        {"state", (uint32_t) info->tcpi_state},
+        {"snd_wscale", (uint32_t) info->tcpi_snd_wscale},
+        {"rcv_wscale", (uint32_t) info->tcpi_rcv_wscale},
+        {"options", (uint32_t) info->tcpi_options},
+        {"flags", (uint32_t) info->tcpi_flags},
+        {"rto", info->tcpi_rto},
+        {"maxseg", info->tcpi_maxseg},
+        {"snd_ssthresh", info->tcpi_snd_ssthresh},
+        {"snd_cwnd", info->tcpi_snd_cwnd},
+        {"snd_wnd", info->tcpi_snd_wnd},
+        {"snd_sbbytes", info->tcpi_snd_sbbytes},
+        {"rcv_wnd", info->tcpi_rcv_wnd},
+        {"srtt", info->tcpi_srtt},
+        {"rttvar", info->tcpi_rttvar},
+    };
+#else
+    return {};
+#endif
+}
+// clang-format on
+#endif
 
 ZEND_FUNCTION(swoole_get_vm_status) {
     array_init(return_value);

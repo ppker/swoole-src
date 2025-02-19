@@ -16,13 +16,18 @@
 
 #include "swoole_http.h"
 #include "swoole_server.h"
+#include "swoole_proxy.h"
+#include "swoole_base64.h"
 
 #include <string>
+#include <sstream>
 
 #include "swoole_util.h"
 #include "swoole_http2.h"
 #include "swoole_websocket.h"
 #include "swoole_static_handler.h"
+
+#include "thirdparty/multipart_parser.h"
 
 using std::string;
 using swoole::http_server::Request;
@@ -39,6 +44,101 @@ static const char *method_strings[] = {
 // clang-format on
 
 namespace swoole {
+
+std::string HttpProxy::get_auth_str() {
+    char auth_buf[256];
+    char encode_buf[512];
+    size_t n = sw_snprintf(auth_buf,
+                           sizeof(auth_buf),
+                           "%.*s:%.*s",
+                           (int) username.length(),
+                           username.c_str(),
+                           (int) password.length(),
+                           password.c_str());
+    base64_encode((unsigned char *) auth_buf, n, encode_buf);
+    return std::string(encode_buf);
+}
+
+size_t HttpProxy::pack(String *send_buffer, const std::string *host_name) {
+    if (!password.empty()) {
+        auto auth_str = get_auth_str();
+        return sw_snprintf(send_buffer->str,
+                           send_buffer->size,
+                           SW_HTTP_PROXY_FMT "Proxy-Authorization: Basic %.*s\r\n\r\n",
+                           (int) target_host.length(),
+                           target_host.c_str(),
+                           target_port,
+                           (int) host_name->length(),
+                           host_name->c_str(),
+                           target_port,
+                           (int) auth_str.length(),
+                           auth_str.c_str());
+    } else {
+        return sw_snprintf(send_buffer->str,
+                           send_buffer->size,
+                           SW_HTTP_PROXY_FMT "\r\n",
+                           (int) target_host.length(),
+                           target_host.c_str(),
+                           target_port,
+                           (int) host_name->length(),
+                           host_name->c_str(),
+                           target_port);
+    }
+}
+
+bool HttpProxy::handshake(String *recv_buffer) {
+    bool ret = false;
+    char *buf = recv_buffer->str;
+    size_t len = recv_buffer->length;
+    int state = 0;
+    char *p = buf;
+    char *pe = buf + len;
+
+    if (recv_buffer->length < sizeof(SW_HTTP_PROXY_HANDSHAKE_RESPONSE) - 1) {
+        return false;
+    }
+
+    for (; p < buf + len; p++) {
+        if (state == 0) {
+            if (SW_STR_ISTARTS_WITH(p, pe - p, "HTTP/1.1") || SW_STR_ISTARTS_WITH(p, pe - p, "HTTP/1.0")) {
+                state = 1;
+                p += sizeof("HTTP/1.x") - 1;
+            } else {
+                break;
+            }
+        } else if (state == 1) {
+            if (isspace(*p)) {
+                continue;
+            } else {
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "200")) {
+                    state = 2;
+                    p += sizeof("200") - 1;
+                } else {
+                    break;
+                }
+            }
+        } else if (state == 2) {
+            ret = true;
+            break;
+            /**
+             * The response message is generally "Connection established,"
+             * although it is not specified in the RFC documents, and thus will not be checked for now.
+             */
+#if SW_HTTP_PROXY_CHECK_MESSAGE
+            if (isspace(*p)) {
+                continue;
+            } else {
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "Connection established")) {
+                    ret = true;
+                }
+                break;
+            }
+#endif
+        }
+    }
+
+    return ret;
+}
 
 bool Server::select_static_handler(http_server::Request *request, Connection *conn) {
     const char *url = request->buffer_->str + request->url_offset_;
@@ -73,7 +173,7 @@ bool Server::select_static_handler(http_server::Request *request, Connection *co
     auto date_str = handler.get_date();
     auto date_str_last_modified = handler.get_date_last_modified();
 
-    string date_if_modified_since = request->get_date_if_modified_since();
+    string date_if_modified_since = request->get_header("If-Modified-Since");
     if (!date_if_modified_since.empty() && handler.is_modified(date_if_modified_since)) {
         response.info.len = sw_snprintf(header_buffer,
                                         sizeof(header_buffer),
@@ -131,22 +231,38 @@ bool Server::select_static_handler(http_server::Request *request, Connection *co
         return true;
     }
 
-    auto task = handler.get_task();
-    response.info.len = sw_snprintf(header_buffer,
-                                    sizeof(header_buffer),
-                                    "HTTP/1.1 200 OK\r\n"
-                                    "Connection: %s\r\n"
-                                    "Content-Length: %ld\r\n"
-                                    "Content-Type: %s\r\n"
-                                    "Date: %s\r\n"
-                                    "Last-Modified: %s\r\n"
-                                    "Server: %s\r\n\r\n",
-                                    request->keep_alive ? "keep-alive" : "close",
-                                    (long) task->length,
-                                    handler.get_mimetype(),
-                                    date_str.c_str(),
-                                    date_str_last_modified.c_str(),
-                                    SW_HTTP_SERVER_SOFTWARE);
+    handler.parse_range(request->get_header("Range").c_str(), request->get_header("If-Range").c_str());
+    auto tasks = handler.get_tasks();
+
+    std::stringstream header_stream;
+    if (1 == tasks.size()) {
+        if (SW_HTTP_PARTIAL_CONTENT == handler.status_code) {
+            header_stream << "Content-Range: bytes " << tasks[0].offset << "-"
+                          << (tasks[0].length + tasks[0].offset - 1) << "/" << handler.get_filesize() << "\r\n";
+        } else {
+            header_stream << "Accept-Ranges: bytes\r\n";
+        }
+    }
+
+    response.info.len =
+        sw_snprintf(header_buffer,
+                    sizeof(header_buffer),
+                    "HTTP/1.1 %s\r\n"
+                    "Connection: %s\r\n"
+                    "Content-Length: %ld\r\n"
+                    "Content-Type: %s\r\n"
+                    "%s"
+                    "Date: %s\r\n"
+                    "Last-Modified: %s\r\n"
+                    "Server: %s\r\n\r\n",
+                    http_server::get_status_message(handler.status_code),
+                    request->keep_alive ? "keep-alive" : "close",
+                    SW_HTTP_HEAD == request->method ? 0 : handler.get_content_length(),
+                    SW_HTTP_HEAD == request->method ? handler.get_mimetype() : handler.get_content_type(),
+                    header_stream.str().c_str(),
+                    date_str.c_str(),
+                    date_str_last_modified.c_str(),
+                    SW_HTTP_SERVER_SOFTWARE);
 
     response.data = header_buffer;
 
@@ -157,11 +273,40 @@ bool Server::select_static_handler(http_server::Request *request, Connection *co
     send_to_connection(&response);
 
     // Send HTTP body
-    if (task->length != 0) {
-        response.info.type = SW_SERVER_EVENT_SEND_FILE;
-        response.info.len = sizeof(*task) + task->length + 1;
-        response.data = (char *) task;
-        send_to_connection(&response);
+    if (SW_HTTP_HEAD != request->method) {
+        if (!tasks.empty()) {
+            size_t task_size = sizeof(network::SendfileTask) + strlen(handler.get_filename()) + 1;
+            network::SendfileTask *task = (network::SendfileTask *) sw_malloc(task_size);
+            strcpy(task->filename, handler.get_filename());
+            if (tasks.size() > 1) {
+                for (auto i = tasks.begin(); i != tasks.end(); i++) {
+                    response.info.type = SW_SERVER_EVENT_SEND_DATA;
+                    response.info.len = strlen(i->part_header);
+                    response.data = i->part_header;
+                    send_to_connection(&response);
+
+                    task->offset = i->offset;
+                    task->length = i->length;
+                    response.info.type = SW_SERVER_EVENT_SEND_FILE;
+                    response.info.len = task_size;
+                    response.data = (char *) task;
+                    send_to_connection(&response);
+                }
+
+                response.info.type = SW_SERVER_EVENT_SEND_DATA;
+                response.info.len = strlen(handler.get_end_part());
+                response.data = handler.get_end_part();
+                send_to_connection(&response);
+            } else if (tasks[0].length > 0) {
+                task->offset = tasks[0].offset;
+                task->length = tasks[0].length;
+                response.info.type = SW_SERVER_EVENT_SEND_FILE;
+                response.info.len = task_size;
+                response.data = (char *) task;
+                send_to_connection(&response);
+            }
+            sw_free(task);
+        }
     }
 
     // Close the connection if keepalive is not used
@@ -184,8 +329,194 @@ void Server::destroy_http_request(Connection *conn) {
     conn->object = nullptr;
 }
 
+void Server::add_http_compression_type(const std::string &type) {
+    if (http_compression_types == nullptr) {
+        http_compression_types = std::make_shared<std::unordered_set<std::string>>();
+    }
+    http_compression_types->emplace(type);
+}
+
 namespace http_server {
 //-----------------------------------------------------------------
+
+static int multipart_on_header_field(multipart_parser *p, const char *at, size_t length) {
+    Request *request = (Request *) p->data;
+    request->form_data_->current_header_name = at;
+    request->form_data_->current_header_name_len = length;
+
+    swoole_trace("header_field: at=%.*s, length=%lu", (int) length, at, length);
+    return 0;
+}
+
+static int multipart_on_header_value(multipart_parser *p, const char *at, size_t length) {
+    swoole_trace("header_value: at=%.*s, length=%lu", (int) length, at, length);
+
+    Request *request = (Request *) p->data;
+    FormData *form_data = request->form_data_;
+
+    form_data->multipart_buffer_->append(form_data->current_header_name, form_data->current_header_name_len);
+    form_data->multipart_buffer_->append(SW_STRL(": "));
+    form_data->multipart_buffer_->append(at, length);
+    form_data->multipart_buffer_->append(SW_STRL("\r\n"));
+
+    if (SW_STRCASEEQ(form_data->current_header_name, form_data->current_header_name_len, "content-disposition")) {
+        ParseCookieCallback cb = [request, form_data, p](char *key, size_t key_len, char *value, size_t value_len) {
+            if (SW_STRCASEEQ(key, key_len, "filename")) {
+                memcpy(form_data->upload_tmpfile->str,
+                       form_data->upload_tmpfile_fmt_.c_str(),
+                       form_data->upload_tmpfile_fmt_.length());
+                form_data->upload_tmpfile->str[form_data->upload_tmpfile_fmt_.length()] = 0;
+                form_data->upload_filesize = 0;
+                int tmpfile = swoole_tmpfile(form_data->upload_tmpfile->str);
+                if (tmpfile < 0) {
+                    request->excepted = true;
+                    return false;
+                }
+
+                FILE *fp = fdopen(tmpfile, "wb+");
+                if (fp == nullptr) {
+                    swoole_sys_warning("fopen(%s) failed", form_data->upload_tmpfile->str);
+                    return false;
+                }
+                p->fp = fp;
+
+                return false;
+            }
+            return true;
+        };
+        parse_cookie(at, length, cb);
+    }
+
+    return 0;
+}
+
+static int multipart_on_data(multipart_parser *p, const char *at, size_t length) {
+    auto request = (Request *) p->data;
+    auto form_data = request->form_data_;
+    swoole_trace("on_data: length=%lu", length);
+
+    if (!p->fp) {
+        if (form_data->multipart_buffer_->length + length > request->max_length_) {
+            request->excepted = 1;
+            request->unavailable = 1;
+            return 1;
+        }
+        form_data->multipart_buffer_->append(at, length);
+        return 0;
+    }
+
+    form_data->upload_filesize += length;
+    if (form_data->upload_filesize > form_data->upload_max_filesize) {
+        request->excepted = 1;
+        request->too_large = 1;
+        return 1;
+    }
+
+    ssize_t n = fwrite(at, sizeof(char), length, p->fp);
+    if (n != (off_t) length) {
+        fclose(p->fp);
+        p->fp = nullptr;
+        request->excepted = 1;
+        request->unavailable = 1;
+        swoole_sys_warning("failed to write upload file");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int multipart_on_header_complete(multipart_parser *p) {
+    swoole_trace("on_header_complete");
+    Request *request = (Request *) p->data;
+    FormData *form_data = request->form_data_;
+    if (p->fp) {
+        form_data->multipart_buffer_->append(SW_STRL(SW_HTTP_UPLOAD_FILE ": "));
+        form_data->multipart_buffer_->append(form_data->upload_tmpfile->str, strlen(form_data->upload_tmpfile->str));
+    }
+    request->multipart_header_parsed = 1;
+    form_data->multipart_buffer_->append(SW_STRL("\r\n"));
+    return 0;
+}
+
+static int multipart_on_data_end(multipart_parser *p) {
+    swoole_trace("on_data_end\n");
+    Request *request = (Request *) p->data;
+    FormData *form_data = request->form_data_;
+    request->multipart_header_parsed = 0;
+    if (p->fp) {
+        form_data->multipart_buffer_->append(SW_STRL("\r\n" SW_HTTP_UPLOAD_FILE));
+        fflush(p->fp);
+        fclose(p->fp);
+        p->fp = nullptr;
+    }
+    form_data->multipart_buffer_->append(SW_STRL("\r\n"));
+    return 0;
+}
+
+static int multipart_on_part_begin(multipart_parser *p) {
+    swoole_trace("on_part_begin");
+    Request *request = (Request *) p->data;
+    FormData *form_data = request->form_data_;
+    form_data->multipart_buffer_->append(p->boundary, p->boundary_length);
+    form_data->multipart_buffer_->append(SW_STRL("\r\n"));
+    return 0;
+}
+
+static int multipart_on_body_end(multipart_parser *p) {
+    Request *request = (Request *) p->data;
+    FormData *form_data = request->form_data_;
+    form_data->multipart_buffer_->append(p->boundary, p->boundary_length);
+    form_data->multipart_buffer_->append(SW_STRL("--"));
+
+    request->content_length_ = form_data->multipart_buffer_->length - request->header_length_;
+    request->tried_to_dispatch = 1;
+
+#if 0
+    /**
+     * Replace content-length with the actual value
+     */
+    char *ptr = request->multipart_buffer_->str - (sizeof("\r\n\r\n") - 1);
+    char *ptr_end = request->multipart_buffer_->str + (request->multipart_buffer_->length - (sizeof("\r\n\r\n") - 1));
+
+    for (; ptr < ptr_end; ptr++) {
+        if (SW_STR_ISTARTS_WITH(ptr, ptr_end - ptr, "Content-Length:")) {
+            ptr += (sizeof("Content-Length:") - 1);
+            // skip spaces
+            while (*ptr == ' ') {
+                ptr++;
+            }
+            break;
+        }
+    }
+
+    std::string actual_content_length = std::to_string(request->content_length_);
+    memcpy(ptr, actual_content_length.c_str(), actual_content_length.length());
+
+    ptr += actual_content_length.length();
+    SW_LOOP {
+        if (*ptr == '\r') {
+            break;
+        } else {
+            *ptr = ' ';
+            ptr++;
+        }
+    }
+#endif
+
+    swoole_trace("end, buffer=%.*s", (int) form_data->multipart_buffer_->length, form_data->multipart_buffer_->str);
+
+    return 0;
+}
+
+static const multipart_parser_settings mt_parser_settings = {
+    multipart_on_header_field,
+    multipart_on_header_value,
+    multipart_on_data,
+    multipart_on_part_begin,
+    multipart_on_header_complete,
+    multipart_on_data_end,
+    multipart_on_body_end,
+};
 
 const char *get_status_message(int code) {
     switch (code) {
@@ -279,6 +610,8 @@ const char *get_status_message(int code) {
         return "429 Too Many Requests";
     case 431:
         return "431 Request Header Fields Too Large";
+    case 451:
+        return "451 Unavailable For Legal Reasons";
     case 500:
         return "500 Internal Server Error";
     case 501:
@@ -305,6 +638,89 @@ const char *get_status_message(int code) {
     default:
         return "200 OK";
     }
+}
+
+void parse_cookie(const char *at, size_t length, const ParseCookieCallback &cb) {
+    char *key, *value;
+    const char *separator = ";\0";
+    size_t key_len = 0;
+    char *strtok_buf = nullptr;
+
+    char *_c = sw_tg_buffer()->str;
+    memcpy(_c, at, length);
+    _c[length] = '\0';
+
+    key = strtok_r(_c, separator, &strtok_buf);
+    while (key) {
+        size_t value_len;
+        value = strchr(key, '=');
+
+        while (isspace(*key)) {
+            key++;
+        }
+
+        if (key == value || *key == '\0') {
+            goto next_cookie;
+        }
+
+        if (value) {
+            *value++ = '\0';
+            value_len = strlen(value);
+        } else {
+            value = (char *) "";
+            value_len = 0;
+        }
+
+        key_len = strlen(key);
+        if (!cb(key, key_len, value, value_len)) {
+            break;
+        }
+    next_cookie:
+        key = strtok_r(NULL, separator, &strtok_buf);
+    }
+}
+
+bool parse_multipart_boundary(
+    const char *at, size_t length, size_t offset, char **out_boundary_str, int *out_boundary_len) {
+    while (offset < length) {
+        if (at[offset] == ' ' || at[offset] == ';') {
+            offset++;
+            continue;
+        }
+        if (SW_STR_ISTARTS_WITH(at + offset, length - offset, "boundary=")) {
+            offset += sizeof("boundary=") - 1;
+            break;
+        }
+        void *delimiter = memchr((void *) (at + offset), ';', length - offset);
+        if (delimiter == nullptr) {
+            return false;
+        } else {
+            offset += (const char *) delimiter - (at + offset);
+        }
+    }
+
+    int boundary_len = length - offset;
+    char *boundary_str = (char *) at + offset;
+    // find eof of boundary
+    if (boundary_len > 0) {
+        // find ';'
+        char *tmp = (char *) memchr(boundary_str, ';', boundary_len);
+        if (tmp) {
+            boundary_len = tmp - boundary_str;
+        }
+    }
+    if (boundary_len <= 0) {
+        return false;
+    }
+    // trim '"'
+    if (boundary_len >= 2 && boundary_str[0] == '"' && *(boundary_str + boundary_len - 1) == '"') {
+        boundary_str++;
+        boundary_len -= 2;
+    }
+    *out_boundary_str = boundary_str;
+    *out_boundary_len = boundary_len;
+
+    return true;
 }
 
 static int url_htoi(char *s) {
@@ -440,7 +856,6 @@ int Request::get_protocol() {
         method = SW_HTTP_PURGE;
         p += 5;
     }
-#ifdef SW_USE_HTTP2
     // HTTP2 Connection Preface
     else if (memcmp(p, SW_STRL("PRI")) == 0) {
         method = SW_HTTP_PRI;
@@ -450,9 +865,7 @@ int Request::get_protocol() {
         } else {
             goto _excepted;
         }
-    }
-#endif
-    else {
+    } else {
     _excepted:
         excepted = 1;
         return SW_ERR;
@@ -480,7 +893,7 @@ int Request::get_protocol() {
             if (isspace(*p)) {
                 continue;
             }
-            if ((size_t)(pe - p) < (sizeof("HTTP/1.x") - 1)) {
+            if ((size_t) (pe - p) < (sizeof("HTTP/1.x") - 1)) {
                 return SW_ERR;
             }
             if (memcmp(p, SW_STRL("HTTP/1.1")) == 0) {
@@ -513,7 +926,7 @@ void Request::parse_header_info() {
 
     for (; p < pe; p++) {
         if (*(p - 1) == '\n' && *(p - 2) == '\r') {
-            if (SW_STRCASECT(p, pe - p, "Content-Length:")) {
+            if (SW_STR_ISTARTS_WITH(p, pe - p, "Content-Length:")) {
                 // strlen("Content-Length:")
                 p += (sizeof("Content-Length:") - 1);
                 // skip spaces
@@ -522,25 +935,35 @@ void Request::parse_header_info() {
                 }
                 content_length_ = strtoull(p, nullptr, 10);
                 known_length = 1;
-            } else if (SW_STRCASECT(p, pe - p, "Connection:")) {
+            } else if (SW_STR_ISTARTS_WITH(p, pe - p, "Connection:")) {
                 // strlen("Connection:")
                 p += (sizeof("Connection:") - 1);
                 // skip spaces
                 while (*p == ' ') {
                     p++;
                 }
-                if (SW_STRCASECT(p, pe - p, "keep-alive")) {
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "keep-alive")) {
                     keep_alive = 1;
                 }
-            } else if (SW_STRCASECT(p, pe - p, "Transfer-Encoding:")) {
+            } else if (SW_STR_ISTARTS_WITH(p, pe - p, "Transfer-Encoding:")) {
                 // strlen("Transfer-Encoding:")
                 p += (sizeof("Transfer-Encoding:") - 1);
                 // skip spaces
                 while (*p == ' ') {
                     p++;
                 }
-                if (SW_STRCASECT(p, pe - p, "chunked")) {
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "chunked")) {
                     chunked = 1;
+                }
+            } else if (SW_STR_ISTARTS_WITH(p, pe - p, "Content-Type:")) {
+                p += (sizeof("Content-Type:") - 1);
+                while (*p == ' ') {
+                    p++;
+                }
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "multipart/form-data")) {
+                    form_data_ = new FormData();
+                    form_data_->multipart_boundary_buf = p + (sizeof("multipart/form-data") - 1);
+                    form_data_->multipart_boundary_len = strchr(p, '\r') - form_data_->multipart_boundary_buf;
                 }
             }
         }
@@ -552,22 +975,96 @@ void Request::parse_header_info() {
     }
 }
 
-#ifdef SW_HTTP_100_CONTINUE
+bool Request::init_multipart_parser(Server *server) {
+    char *boundary_str;
+    int boundary_len;
+    if (!parse_multipart_boundary(
+            form_data_->multipart_boundary_buf, form_data_->multipart_boundary_len, 0, &boundary_str, &boundary_len)) {
+        return false;
+    }
+
+    form_data_->multipart_parser_ = multipart_parser_init(boundary_str, boundary_len, &mt_parser_settings);
+    if (!form_data_->multipart_parser_) {
+        swoole_warning("multipart_parser_init() failed");
+        return false;
+    }
+    form_data_->multipart_parser_->data = this;
+
+    auto tmp_buffer = new String(SW_BUFFER_SIZE_BIG);
+    tmp_buffer->append(buffer_->str + header_length_, buffer_->length - header_length_);
+    form_data_->multipart_buffer_ = buffer_;
+    form_data_->multipart_buffer_->length = header_length_;
+    buffer_ = tmp_buffer;
+    form_data_->upload_tmpfile_fmt_ = server->upload_tmp_dir + "/swoole.upfile.XXXXXX";
+    form_data_->upload_tmpfile = new String(form_data_->upload_tmpfile_fmt_);
+    form_data_->upload_max_filesize = server->upload_max_filesize;
+
+    return true;
+}
+
+void Request::destroy_multipart_parser() {
+    auto tmp_buffer = buffer_;
+    delete tmp_buffer;
+    buffer_ = form_data_->multipart_buffer_;
+    form_data_->multipart_buffer_ = nullptr;
+    if (form_data_->multipart_parser_->fp) {
+        fclose(form_data_->multipart_parser_->fp);
+        unlink(form_data_->upload_tmpfile->str);
+    }
+    multipart_parser_free(form_data_->multipart_parser_);
+    form_data_->multipart_parser_ = nullptr;
+    delete form_data_->upload_tmpfile;
+    form_data_->upload_tmpfile = nullptr;
+    delete form_data_;
+    form_data_ = nullptr;
+}
+
+bool Request::parse_multipart_data(String *buffer) {
+    excepted = 0;
+    ssize_t n = multipart_parser_execute(form_data_->multipart_parser_, buffer->str, buffer->length);
+    swoole_trace("multipart_parser_execute: buffer->length=%lu, n=%lu\n", buffer->length, n);
+    if (n < 0) {
+        int l_error =
+            multipart_parser_error_msg(form_data_->multipart_parser_, sw_tg_buffer()->str, sw_tg_buffer()->size);
+        swoole_error_log(SW_LOG_NOTICE,
+                         SW_ERROR_SERVER_INVALID_REQUEST,
+                         "parse multipart body failed, reason: %.*s",
+                         l_error,
+                         sw_tg_buffer()->str);
+        return false;
+    } else if ((size_t) n != buffer->length) {
+        swoole_error_log(SW_LOG_NOTICE,
+                         SW_ERROR_SERVER_INVALID_REQUEST,
+                         "parse multipart body failed, %zu/%zu bytes processed",
+                         n,
+                         buffer->length);
+        return excepted;
+    }
+    buffer->clear();
+    return true;
+}
+
+Request::~Request() {
+    if (form_data_) {
+        destroy_multipart_parser();
+    }
+}
+
 bool Request::has_expect_header() {
     // char *buf = buffer->str + buffer->offset;
     char *buf = buffer_->str;
     // int len = buffer->length - buffer->offset;
-    int len = buffer_->length;
+    size_t len = buffer_->length;
 
     char *pe = buf + len;
     char *p;
 
     for (p = buf; p < pe; p++) {
-        if (*p == '\r' && pe - p > sizeof("\r\nExpect")) {
+        if (*p == '\r' && (size_t) (pe - p) > sizeof("\r\nExpect")) {
             p += 2;
-            if (SW_STRCASECT(p, pe - p, "Expect: ")) {
+            if (SW_STR_ISTARTS_WITH(p, pe - p, "Expect: ")) {
                 p += sizeof("Expect: ") - 1;
-                if (SW_STRCASECT(p, pe - p, "100-continue")) {
+                if (SW_STR_ISTARTS_WITH(p, pe - p, "100-continue")) {
                     return true;
                 } else {
                     return false;
@@ -579,7 +1076,6 @@ bool Request::has_expect_header() {
     }
     return false;
 }
-#endif
 
 int Request::get_header_length() {
     char *p = buffer_->str + buffer_->offset;
@@ -602,7 +1098,7 @@ int Request::get_chunked_body_length() {
     char *pe = buffer_->str + buffer_->length;
 
     while (1) {
-        if ((size_t)(pe - p) < (1 + (sizeof("\r\n") - 1))) {
+        if ((size_t) (pe - p) < (1 + (sizeof("\r\n") - 1))) {
             /* need the next chunk */
             return SW_ERR;
         }
@@ -631,34 +1127,50 @@ int Request::get_chunked_body_length() {
     return SW_OK;
 }
 
-string Request::get_date_if_modified_since() {
+string Request::get_header(const char *name) {
+    size_t name_len = strlen(name);
     char *p = buffer_->str + url_offset_ + url_length_ + 10;
     char *pe = buffer_->str + header_length_;
 
-    string result;
-
-    char *date_if_modified_since = nullptr;
-    size_t length_if_modified_since = 0;
+    char *buffer = nullptr;
+    char *colon = nullptr;
 
     int state = 0;
+    int i = 0;
+
+    bool is_error_header_name = false;
+
     for (; p < pe; p++) {
         switch (state) {
         case 0:
-            if (SW_STRCASECT(p, pe - p, "If-Modified-Since")) {
-                p += sizeof("If-Modified-Since");
+            if (SW_STR_ISTARTS_WITH(p, pe - p, "\r\n")) {
+                i = 0;
+                is_error_header_name = false;
+                break;
+            }
+
+            if (!is_error_header_name && swoole_str_istarts_with(p, pe - p, name, name_len)) {
+                colon = p + name_len;
+                if (colon[0] != ':' || i > 1) {
+                    is_error_header_name = true;
+                    break;
+                }
+
+                p += name_len;
                 state = 1;
             }
+
+            i++;
             break;
         case 1:
             if (!isspace(*p)) {
-                date_if_modified_since = p;
+                buffer = p;
                 state = 2;
             }
             break;
         case 2:
-            if (SW_STRCASECT(p, pe - p, "\r\n")) {
-                length_if_modified_since = p - date_if_modified_since;
-                return string(date_if_modified_since, length_if_modified_since);
+            if (SW_STR_ISTARTS_WITH(p, pe - p, "\r\n")) {
+                return string(buffer, p - buffer);
             }
             break;
         default:
@@ -666,7 +1178,7 @@ string Request::get_date_if_modified_since() {
         }
     }
 
-    return string("");
+    return string();
 }
 
 int get_method(const char *method_str, size_t method_len) {
@@ -695,9 +1207,6 @@ int dispatch_request(Server *serv, const Protocol *proto, Socket *_socket, const
 }
 
 //-----------------------------------------------------------------
-
-#ifdef SW_USE_HTTP2
-
 static void protocol_status_error(Socket *socket, Connection *conn) {
     swoole_error_log(SW_LOG_WARNING,
                      SW_ERROR_PROTOCOL_ERROR,
@@ -722,7 +1231,7 @@ ssize_t get_package_length(const Protocol *protocol, Socket *socket, PacketLengt
 uint8_t get_package_length_size(Socket *socket) {
     Connection *conn = (Connection *) socket->object;
     if (conn->websocket_status >= websocket::STATUS_HANDSHAKE) {
-        return SW_WEBSOCKET_HEADER_LEN + SW_WEBSOCKET_MASK_LEN + sizeof(uint64_t);
+        return SW_WEBSOCKET_MESSAGE_HEADER_SIZE;
     } else if (conn->http2_stream) {
         return SW_HTTP2_FRAME_HEADER_SIZE;
     } else {
@@ -742,6 +1251,5 @@ int dispatch_frame(const Protocol *proto, Socket *socket, const RecvData *rdata)
         return SW_ERR;
     }
 }
-#endif
 }  // namespace http_server
 }  // namespace swoole
