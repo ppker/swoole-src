@@ -37,6 +37,7 @@ zend_class_entry *swoole_http_server_ce;
 zend_object_handlers swoole_http_server_handlers;
 
 static SW_THREAD_LOCAL std::queue<HttpContext *> queued_http_contexts;
+static SW_THREAD_LOCAL std::unordered_map<SessionId, zend::Variable> server_ips;
 static SW_THREAD_LOCAL std::unordered_map<SessionId, zend::Variable> client_ips;
 
 static bool http_context_send_data(HttpContext *ctx, const char *data, size_t length);
@@ -117,32 +118,8 @@ int php_swoole_http_server_onReceive(Server *serv, RecvData *req) {
 
     do {
         zval *zserver = ctx->request.zserver;
-        Connection *serv_sock = serv->get_connection(conn->server_fd);
         HashTable *ht = Z_ARR_P(zserver);
-
-        if (serv_sock) {
-            http_server_add_server_array(
-                ht, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_PORT), (zend_long) serv_sock->info.get_port());
-        }
-        http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_PORT), (zend_long) conn->info.get_port());
-
-        if (conn->info.is_loopback_addr()) {
-            auto key = conn->info.type == SW_SOCK_TCP6 ? SW_ZEND_STR_ADDR_LOOPBACK_V6 : SW_ZEND_STR_ADDR_LOOPBACK_V4;
-            http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), SW_ZSTR_KNOWN(key));
-        } else {
-            if (serv->is_base_mode() && ctx->keepalive) {
-                auto iter = client_ips.find(session_id);
-                if (iter == client_ips.end()) {
-                    auto rs = client_ips.emplace(session_id, conn->info.get_addr());
-                    iter = rs.first;
-                }
-                iter->second.add_ref();
-                http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), iter->second.ptr());
-            } else {
-                http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), conn->info.get_addr());
-            }
-        }
-
+        swoole_http_server_populate_ip_and_port(serv, ht, conn, session_id, ctx->keepalive);
         http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_MASTER_TIME), (zend_long) conn->last_recv_time);
     } while (false);
 
@@ -185,6 +162,7 @@ _dtor_and_return:
 }
 
 void php_swoole_http_server_onClose(Server *serv, DataHead *info) {
+    server_ips.erase(info->fd);
     client_ips.erase(info->fd);
     php_swoole_server_onClose(serv, info);
 }
@@ -210,6 +188,7 @@ void php_swoole_http_server_rshutdown() {
         SG(rfc1867_uploaded_files) = nullptr;
     }
 
+    server_ips.clear();
     client_ips.clear();
     while (!queued_http_contexts.empty()) {
         HttpContext *ctx = queued_http_contexts.front();
@@ -433,5 +412,57 @@ void swoole_http_server_onAfterResponse(HttpContext *ctx) {
                 zval_ptr_dtor(ctx->response.zobject);
             },
             _ctx);
+    }
+}
+
+/**
+ * When calculating the server-side IP and client-side IP, since these two calculations
+ * share the same memory block, they cannot be performed simultaneously; otherwise,
+ * both results would be identical. Therefore, it is necessary to first calculate the client-side IP,
+ * write it to the cache, and then proceed to calculate the server-side IP.
+ */
+static void http_server_session_track_ip(swoole::Server *server,
+                                         HashTable *ht,
+                                         swoole::Connection *conn,
+                                         swoole::SessionId session_id,
+                                         zend_string *known_string,
+                                         std::unordered_map<swoole::SessionId, zend::Variable> &ips) {
+    auto iter = ips.find(session_id);
+    if (iter == ips.end()) {
+        const char *address = nullptr;
+        if (known_string == SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_ADDR)) {
+            address = server->get_local_addr(conn);
+        } else {
+            address = conn->info.get_addr();
+        }
+
+        auto rs = ips.emplace(session_id, address);
+        iter = rs.first;
+    }
+
+    iter->second.add_ref();
+    http_server_add_server_array(ht, known_string, iter->second.ptr());
+}
+
+void swoole_http_server_populate_ip_and_port(
+    Server *server, HashTable *ht, Connection *conn, SessionId session_id, bool keepalive) {
+    http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_PORT), (zend_long) conn->local_port);
+    http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_PORT), (zend_long) conn->info.get_port());
+
+    if (conn->info.is_loopback_addr()) {
+        auto key = conn->info.type == SW_SOCK_TCP6 ? SW_ZEND_STR_ADDR_LOOPBACK_V6 : SW_ZEND_STR_ADDR_LOOPBACK_V4;
+        http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_ADDR), SW_ZSTR_KNOWN(key));
+        http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), SW_ZSTR_KNOWN(key));
+    } else {
+        if (keepalive && (server->is_base_mode() ||
+                          (server->is_process_mode() && server->dispatch_mode == Server::DISPATCH_FDMOD))) {
+            http_server_session_track_ip(
+                server, ht, conn, session_id, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_ADDR), server_ips);
+            http_server_session_track_ip(
+                server, ht, conn, session_id, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), client_ips);
+        } else {
+            http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_SERVER_ADDR), server->get_local_addr(conn));
+            http_server_add_server_array(ht, SW_ZSTR_KNOWN(SW_ZEND_STR_REMOTE_ADDR), server->get_remote_addr(conn));
+        }
     }
 }

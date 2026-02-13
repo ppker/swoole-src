@@ -24,6 +24,8 @@
 #include "swoole_api.h"
 
 #include <cassert>
+#include <net/if.h>
+#include <ifaddrs.h>
 
 using swoole::network::Address;
 using swoole::network::SendfileTask;
@@ -795,6 +797,10 @@ int Server::create() {
 
     if (swoole_isset_hook(SW_GLOBAL_HOOK_BEFORE_SERVER_CREATE)) {
         swoole_call_hook(SW_GLOBAL_HOOK_BEFORE_SERVER_CREATE, this);
+    }
+
+    if (!init_network_interface_addr_map()) {
+        return SW_ERR;
     }
 
     session_list = static_cast<Session *>(sw_shm_calloc(SW_SESSION_LIST_SIZE, sizeof(Session)));
@@ -1608,7 +1614,7 @@ bool Server::sendfile(SessionId session_id, const char *file, uint32_t l_file, o
                          "sendfile name[%.8s...] length %u is exceed the max name len %u",
                          file,
                          l_file,
-                         (uint32_t) (SW_IPC_BUFFER_SIZE - sizeof(SendfileTask) - 1));
+                         (uint32_t)(SW_IPC_BUFFER_SIZE - sizeof(SendfileTask) - 1));
         return false;
     }
     // string must be zero termination (for `state` system call)
@@ -1987,6 +1993,79 @@ void Server::abort_worker(Worker *worker) const {
     }
 }
 
+bool Server::init_network_interface_addr_map() {
+    struct ifaddrs *ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0) {
+        swoole_sys_warning("getifaddrs() failed");
+        return false;
+    }
+
+    uint16_t index = 1;
+    for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !(ifa->ifa_flags & IFF_UP)) {
+            continue;
+        }
+        network::Address na{};
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *) ifa->ifa_addr;
+            na.addr.inet_v4.sin_family = AF_INET;
+            na.addr.inet_v4.sin_addr = sin->sin_addr;
+            na.type = SW_SOCK_TCP;
+            local_addr_v4_map.emplace(index++, na);
+        } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) ifa->ifa_addr;
+            na.addr.inet_v6.sin6_family = AF_INET6;
+            na.addr.inet_v6.sin6_addr = sin6->sin6_addr;
+            na.type = SW_SOCK_TCP6;
+            local_addr_v6_map.emplace(index++, na);
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return true;
+}
+
+uint16_t Server::get_local_addr_index(network::Address *addr) {
+    if (addr->type == SW_SOCK_TCP) {
+        for (auto kv : local_addr_v4_map) {
+            if (memcmp(addr->addr_v4(), kv.second.addr_v4(), sizeof(*addr->addr_v4())) == 0) {
+                return kv.first;
+            }
+        }
+    } else {
+        for (auto kv : local_addr_v6_map) {
+            if (memcmp(addr->addr_v6(), kv.second.addr_v6(), sizeof(*addr->addr_v6())) == 0) {
+                return kv.first;
+            }
+        }
+    }
+    return 0;
+}
+
+const char *Server::get_local_addr(Connection *conn) {
+    if (conn->socket_type == SW_SOCK_TCP) {
+        auto iter = local_addr_v4_map.find(conn->local_addr_index);
+        if (iter != local_addr_v4_map.end()) {
+            return iter->second.get_addr();
+        } else {
+            return "127.0.0.1";
+        }
+    } else if (conn->socket_type == SW_SOCK_TCP6) {
+        auto iter = local_addr_v6_map.find(conn->local_addr_index);
+        if (iter != local_addr_v6_map.end()) {
+            return iter->second.get_addr();
+        } else {
+            return "::1";
+        }
+    } else {
+        return get_port_by_server_fd(conn->server_fd)->host.c_str();
+    }
+}
+
+const char *Server::get_remote_addr(Connection *conn) {
+    return conn->info.get_addr();
+}
+
 /**
  * new connection
  */
@@ -2059,6 +2138,10 @@ _find_available_slot:
     memcpy(&connection->info.addr, &_socket->info.addr, _socket->info.len);
     connection->info.len = _socket->info.len;
     connection->info.type = connection->socket_type;
+
+    connection->socket->get_name();
+    connection->local_port = connection->socket->info.get_port();
+    connection->local_addr_index = get_local_addr_index(&connection->socket->info);
 
     if (!ls->ssl) {
         _socket->direct_send = 1;

@@ -25,6 +25,8 @@
 
 bool swoole_http_server_onBeforeRequest(swoole::http::Context *ctx);
 void swoole_http_server_onAfterResponse(swoole::http::Context *ctx);
+void swoole_http_server_populate_ip_and_port(
+    swoole::Server *server, HashTable *ht, swoole::Connection *conn, swoole::SessionId session_id, bool keepalive);
 
 int swoole_websocket_onMessage(swoole::Server *serv, swoole::RecvData *req);
 int swoole_websocket_onHandshake(swoole::Server *serv, swoole::ListenPort *port, swoole::http::Context *ctx);

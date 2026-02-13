@@ -102,6 +102,8 @@ struct Connection {
     sw_atomic_t recv_queued_bytes;
     uint32_t send_queued_bytes;
     uint16_t waiting_time;
+    uint16_t local_port;
+    uint16_t local_addr_index;
     TimerNode *timer;
     /**
      * socket address
@@ -1162,6 +1164,8 @@ class Server {
     void add_hook(enum HookType type, const Callback &func, int push_back);
     bool add_command(const std::string &command, int accepted_process_types, const Command::Handler &func);
     Connection *add_connection(const ListenPort *ls, network::Socket *_socket, int server_fd);
+    const char *get_local_addr(Connection *conn);
+    const char *get_remote_addr(Connection *conn);
     void abort_connection(Reactor *reactor, const ListenPort *ls, network::Socket *_socket) const;
     void abort_worker(Worker *worker) const;
     void reset_worker_counter(Worker *worker) const;
@@ -1669,6 +1673,8 @@ class Server {
      * Only used for temporarily saving pointers in add_worker()
      */
     std::vector<Worker *> user_worker_list;
+    std::unordered_map<uint16_t, network::Address> local_addr_v4_map;
+    std::unordered_map<uint16_t, network::Address> local_addr_v6_map;
 
     int create_pipe_buffers();
     void release_pipe_buffers();
@@ -1696,6 +1702,8 @@ class Server {
     void stop_master_thread();
     void join_heartbeat_thread();
     TimerCallback get_timeout_callback(ListenPort *port, Reactor *reactor, Connection *conn) const;
+    bool init_network_interface_addr_map();
+    uint16_t get_local_addr_index(network::Address *addr);
 
     int get_lowest_load_worker_id() const {
         uint32_t lowest_load_worker_id = 0;

@@ -362,6 +362,8 @@ static void test_base() {
 
     serv.onReceive = [](Server *serv, RecvData *req) -> int {
         EXPECT_EQ(string(req->data, req->info.len), string(packet));
+        auto conn = serv->get_connection_by_session_id(req->session_id());
+        EXPECT_NE(strcmp(serv->get_local_addr(conn), "unknown"), 0);
 
         string resp = string("Server: ") + string(packet);
         serv->send(req->info.fd, resp.c_str(), resp.length());

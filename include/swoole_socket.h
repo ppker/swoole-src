@@ -125,6 +125,14 @@ struct Address {
     bool is_loopback_addr() const;
     bool empty() const;
 
+    in_addr *addr_v4() {
+        return &addr.inet_v4.sin_addr;
+    }
+
+    in6_addr *addr_v6() {
+        return &addr.inet_v6.sin6_addr;
+    }
+
     /**
      * Get the string representation of the address
      */
