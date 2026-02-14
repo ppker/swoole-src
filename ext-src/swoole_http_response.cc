@@ -604,7 +604,7 @@ bool HttpContext::compress(const char *data, size_t length) {
         compression_level = Z_BEST_COMPRESSION;
     }
 
-    size_t memory_size = ((size_t) ((double) length * (double) 1.015)) + 10 + 8 + 4 + 1;
+    size_t memory_size = ((size_t)((double) length * (double) 1.015)) + 10 + 8 + 4 + 1;
     zlib_buffer = std::make_shared<String>(memory_size);
 
     z_stream zstream = {};
@@ -612,7 +612,8 @@ bool HttpContext::compress(const char *data, size_t length) {
     zstream.zalloc = php_zlib_alloc;
     zstream.zfree = php_zlib_free;
 
-    int status = deflateInit2(&zstream, compression_level, Z_DEFLATED, encoding, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+    int status =
+        deflateInit2(&zstream, compression_level, Z_DEFLATED, encoding, SW_ZLIB_DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY);
     if (status != Z_OK) {
         swoole_warning("deflateInit2() failed, Error: [%d]", status);
         return false;

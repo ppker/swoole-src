@@ -30,6 +30,12 @@ using swoole::Reactor;
 using swoole::translate_events_to_poll;
 
 static bool swoole_pgsql_blocking = true;
+/**
+ * In macOS, under special circumstances, the poll function will not return a readable or writable signal. It is
+ * necessary to set a relatively short poll timeout value to allow it to fail quickly. Then, re-execute PQconnectPoll,
+ * and let the libpq underlying code determine whether the connection is ready or if an error has occurred.
+ */
+static const double swoole_pgsql_poll_timeout = 0.1;
 
 void swoole_libpq_version(char *buf, size_t len)
 {
@@ -45,7 +51,7 @@ void swoole_libpq_version(char *buf, size_t len)
     }
 }
 
-static int swoole_pgsql_socket_poll(PGconn *conn, EventType event, double timeout = -1, bool check_nonblock = false) {
+static int swoole_pgsql_socket_poll(PGconn *conn, EventType event, bool check_nonblock = false) {
     if (swoole_pgsql_blocking) {
         struct pollfd fds[1];
         fds[0].fd = PQsocket(conn);
@@ -53,16 +59,16 @@ static int swoole_pgsql_socket_poll(PGconn *conn, EventType event, double timeou
 
         int result = 0;
         do {
-            result = poll(fds, 1, timeout);
+            result = poll(fds, 1, swoole_pgsql_poll_timeout * 1000);
         } while (result < 0 && errno == EINTR);
 
-        return result > 0 ? 1 : errno == ETIMEDOUT ? 0 : -1;
+        return result;
     }
 
     SocketImpl sock(PQsocket(conn), SW_SOCK_RAW);
     sock.get_socket()->nonblock = 1;
 
-    bool retval = sock.poll(event, timeout);
+    bool retval = sock.poll(event, swoole_pgsql_poll_timeout);
     while (check_nonblock && event == SW_EVENT_READ) {
         if (PQconsumeInput(conn) == 0) {
             retval = false;
@@ -71,7 +77,7 @@ static int swoole_pgsql_socket_poll(PGconn *conn, EventType event, double timeou
         if (PQisBusy(conn) == 0) {
             break;
         }
-        retval = sock.poll(event, timeout);
+        retval = sock.poll(event, swoole_pgsql_poll_timeout);
     }
 
     sock.move_fd();
@@ -96,8 +102,8 @@ static int swoole_pgsql_flush(PGconn *conn) {
 static PGresult *swoole_pgsql_get_result(PGconn *conn) {
     PGresult *result, *last_result = nullptr;
     // PQgetResult will block the process; it is necessary to forcibly check if the data is ready.
-    int poll_ret = swoole_pgsql_socket_poll(conn, SW_EVENT_READ, -1, true);
-    if (sw_unlikely(poll_ret == SW_ERR)) {
+    int poll_ret = swoole_pgsql_socket_poll(conn, SW_EVENT_READ, true);
+    if (sw_unlikely(poll_ret < 0)) {
         return nullptr;
     }
 
@@ -147,7 +153,7 @@ PGconn *swoole_pgsql_connectdb(const char *conninfo) {
             break;
         }
 
-        if (swoole_pgsql_socket_poll(conn, event) <= 0) {
+        if (swoole_pgsql_socket_poll(conn, event) < 0) {
             break;
         }
     }
