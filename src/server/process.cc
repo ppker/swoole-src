@@ -218,9 +218,8 @@ bool Server::create_worker_pipes() {
     }
 
     init_ipc_max_size();
-    if (create_pipe_buffers() < 0) {
-        return false;
-    }
+    message_bus.set_buffer_size(ipc_max_size);
+
     return true;
 }
 

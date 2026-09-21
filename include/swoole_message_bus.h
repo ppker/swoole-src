@@ -111,7 +111,15 @@ class MessageBus {
     }
 
     size_t get_memory_size() const;
-    bool alloc_buffer();
+
+    void alloc_buffer() {
+    	void *_ptr = allocator_->malloc(buffer_size_);
+    	if (sw_unlikely(_ptr == nullptr)) {
+    		throw std::bad_alloc();
+    	}
+		buffer_ = (PipeBuffer *) _ptr;
+		sw_memset_zero(&buffer_->info, sizeof(buffer_->info));
+    }
 
     /**
      * If use the zend_string_allocator, must manually call this function to release the memory,
@@ -146,7 +154,10 @@ class MessageBus {
      * The last chunk of data has been received, return address and length, start processing this packet.
      */
     PacketPtr get_packet() const;
-    PipeBuffer *get_buffer() const {
+    PipeBuffer *get_buffer() {
+    	if (sw_unlikely(buffer_ == nullptr)) {
+    		alloc_buffer();
+    	}
         return buffer_;
     }
     /**

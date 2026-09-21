@@ -1779,8 +1779,6 @@ class Server {
     std::unordered_map<uint16_t, network::Address> local_addr_v4_map;
     std::unordered_map<uint16_t, network::Address> local_addr_v6_map;
 
-    int create_pipe_buffers();
-    void release_pipe_buffers();
     void create_worker(Worker *worker);
     Factory *create_base_factory();
     Factory *create_thread_factory();

@@ -276,6 +276,7 @@ void Server::call_worker_stop_callback(Worker *worker) {
             SW_LOG_WARNING, SW_ERROR_SERVER_WORKER_UNPROCESSED_DATA, "unprocessed data in the worker process buffer");
         get_worker_message_bus()->clear();
     }
+    get_worker_message_bus()->free_buffer();
 
     SwooleWG.running = false;
     if (SwooleWG.worker_copy) {

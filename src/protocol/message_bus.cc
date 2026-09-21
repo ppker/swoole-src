@@ -43,17 +43,6 @@ PacketPtr MessageBus::get_packet() const {
     return pkt;
 }
 
-bool MessageBus::alloc_buffer() {
-    void *_ptr = allocator_->malloc(buffer_size_);
-    if (_ptr) {
-        buffer_ = (PipeBuffer *) _ptr;
-        sw_memset_zero(&buffer_->info, sizeof(buffer_->info));
-        return true;
-    } else {
-        return false;
-    }
-}
-
 void MessageBus::pass(const SendData *task) const {
     memcpy(&buffer_->info, &task->info, sizeof(buffer_->info));
     if (task->info.len > 0) {

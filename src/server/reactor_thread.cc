@@ -824,9 +824,6 @@ int ReactorThread::init(Server *serv, Reactor *reactor, uint16_t reactor_id) {
     message_bus.set_id_generator(serv->msg_id_generator);
     message_bus.set_buffer_size(serv->ipc_max_size);
     message_bus.set_always_chunked_transfer();
-    if (!message_bus.alloc_buffer()) {
-        return SW_ERR;
-    }
 
     SW_LOOP_N(serv->worker_num) {
         if (i % serv->reactor_num != reactor_id) {

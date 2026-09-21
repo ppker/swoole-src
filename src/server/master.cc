@@ -1127,8 +1127,6 @@ void Server::destroy() {
         destroy_worker(worker);
     }
 
-    release_pipe_buffers();
-
     for (auto port : ports) {
         port->close();
     }
@@ -2323,18 +2321,6 @@ void Server::init_pipe_sockets(MessageBus *mb) const {
         mb->init_pipe_socket(worker->pipe_master);
         mb->init_pipe_socket(worker->pipe_worker);
     }
-}
-
-/**
- * allocate memory for Server::pipe_buffers
- */
-int Server::create_pipe_buffers() {
-    message_bus.set_buffer_size(ipc_max_size);
-    return message_bus.alloc_buffer() ? SW_OK : SW_ERR;
-}
-
-void Server::release_pipe_buffers() {
-    message_bus.free_buffer();
 }
 
 uint32_t Server::get_idle_worker_num() const {
